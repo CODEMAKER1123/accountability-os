@@ -71,7 +71,42 @@ pub fn revise_day(
     if input.date != today_local() {
         return Err(AppError::invalid("Only today's plan can be edited."));
     }
-    let (plan, commitments) = state.db.with_tx(|tx| plans::revise_day(tx, &input))?;
+    // Keep the final old-context activity and the plan mutation on one side
+    // of the same monitoring boundary used by focus and break transitions.
+    let _history_guard = state.activity_history_boundary.lock();
+    let expected_impact = state.db.with(|conn| plans::validate_revision(conn, &input))?;
+    if expected_impact.semantics_changed() {
+        crate::engine::flush_open_session(&app);
+        let prefixes = expected_impact
+            .semantic_commitment_ids
+            .iter()
+            .map(|id| format!("c{id}|"))
+            .collect::<Vec<_>>();
+        let mut engine = state.engine.lock();
+        // An in-flight answer was prompted with the old title/definition.
+        // Cancel it before the durable cache is cleared so it cannot restore
+        // a stale answer after this edit.
+        state.invalidate_activity_tasks_with_engine(&mut engine);
+        engine
+            .classification_cache
+            .retain(|key, _| !prefixes.iter().any(|prefix| key.starts_with(prefix)));
+    }
+    let (plan, commitments, applied_impact) = state.db.with_tx(|tx| {
+        let result = plans::revise_day(tx, &input)?;
+        if result.2.semantics_changed() {
+            for id in &result.2.semantic_commitment_ids {
+                tx.execute(
+                    "DELETE FROM classification_cache WHERE cache_key LIKE ?1",
+                    [format!("c{id}|%")],
+                )?;
+            }
+            // The generation boundary above cancels every in-flight task.
+            // Do not leave its placeholder sessions stuck as pending.
+            tx.execute("UPDATE activity_sessions SET pending_ai=0 WHERE pending_ai=1", [])?;
+        }
+        Ok(result)
+    })?;
+    debug_assert_eq!(expected_impact, applied_impact);
     {
         let mut engine = state.engine.lock();
         if let Some(active) = engine.active_commitment.as_mut() {

@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 /// never fall through to the rules/cache/AI path.
 pub const PRIVATE_PROCESS_SENTINEL: &str = "__private__";
 
+/// Stable reason stored for activity that occurred during an intentional
+/// break. Consumers use it to keep planned rest out of productivity math.
+pub const PLANNED_BREAK_REASON: &str = "Planned break";
+
 /// One classification per activity session (spec §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

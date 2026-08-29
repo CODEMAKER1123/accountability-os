@@ -112,6 +112,18 @@ pub struct ReviseDayInput {
     pub interview_answers: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevisionImpact {
+    /// Existing commitments whose AI classification context changed.
+    pub semantic_commitment_ids: Vec<i64>,
+}
+
+impl RevisionImpact {
+    pub fn semantics_changed(&self) -> bool {
+        !self.semantic_commitment_ids.is_empty()
+    }
+}
+
 impl ReviseDayInput {
     fn validation_input(&self) -> LockDayInput {
         LockDayInput {
@@ -242,6 +254,81 @@ fn normalized_step_title(title: &str) -> String {
         .to_lowercase()
 }
 
+fn prepare_revision(
+    conn: &Connection,
+    input: &ReviseDayInput,
+) -> AppResult<(DailyPlan, Vec<Commitment>, Vec<Vec<String>>, RevisionImpact)> {
+    let validation_input = input.validation_input();
+    let prepared_steps = validate_day_input(&validation_input)?;
+    let plan = get_plan_by_date(conn, &input.date)?
+        .ok_or_else(|| AppError::invalid("There is no plan to edit for this day."))?;
+    if plan.locked_at.is_none() {
+        return Err(AppError::invalid("This day is not locked yet. Lock it instead."));
+    }
+    if plan.ended_at.is_some() {
+        return Err(AppError::invalid("A completed day can no longer be edited."));
+    }
+    if plan.is_day_off {
+        return Err(AppError::invalid("A day marked off has no active plan to edit."));
+    }
+
+    let existing = list_commitments(conn, plan.id)?;
+    let existing_by_id: HashMap<i64, &Commitment> =
+        existing.iter().map(|commitment| (commitment.id, commitment)).collect();
+    let mut submitted_ids = HashSet::new();
+    let mut semantic_commitment_ids = Vec::new();
+    for item in &input.commitments {
+        let Some(id) = item.id else {
+            continue;
+        };
+        let Some(current) = existing_by_id.get(&id) else {
+            return Err(AppError::invalid(
+                "One of those commitments does not belong to today's plan.",
+            ));
+        };
+        if !submitted_ids.insert(id) {
+            return Err(AppError::invalid(
+                "The revised plan contains the same commitment more than once.",
+            ));
+        }
+        if current.task_id != item.commitment.task_id {
+            return Err(AppError::invalid(
+                "An existing commitment cannot be linked to a different backlog task.",
+            ));
+        }
+        if current.title != item.commitment.title.trim()
+            || current.done_definition != item.commitment.done_definition.trim()
+        {
+            semantic_commitment_ids.push(id);
+        }
+    }
+
+    if existing.iter().any(|commitment| {
+        !submitted_ids.contains(&commitment.id)
+            && (commitment.status != "pending" || commitment.started_at.is_some())
+    }) {
+        return Err(AppError::invalid(
+            "Started, completed, or otherwise closed commitments must stay in today's record. You can still edit their details.",
+        ));
+    }
+
+    Ok((
+        plan,
+        existing,
+        prepared_steps,
+        RevisionImpact {
+            semantic_commitment_ids,
+        },
+    ))
+}
+
+/// Validate a proposed revision without mutating the plan. Commands use this
+/// before flushing the open activity boundary so rejected edits are no-ops.
+pub fn validate_revision(conn: &Connection, input: &ReviseDayInput) -> AppResult<RevisionImpact> {
+    let (_, _, _, impact) = prepare_revision(conn, input)?;
+    Ok(impact)
+}
+
 /// Create + lock the daily plan (spec §6 "LOCK MY DAY").
 pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(DailyPlan, Vec<Commitment>)> {
     let prepared_steps = validate_day_input(input)?;
@@ -336,58 +423,19 @@ pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(
 pub fn revise_day(
     tx: &rusqlite::Transaction,
     input: &ReviseDayInput,
-) -> AppResult<(DailyPlan, Vec<Commitment>)> {
-    let validation_input = input.validation_input();
-    let prepared_steps = validate_day_input(&validation_input)?;
-    let plan = get_plan_by_date(tx, &input.date)?
-        .ok_or_else(|| AppError::invalid("There is no plan to edit for this day."))?;
-    if plan.locked_at.is_none() {
-        return Err(AppError::invalid("This day is not locked yet. Lock it instead."));
-    }
-    if plan.ended_at.is_some() {
-        return Err(AppError::invalid("A completed day can no longer be edited."));
-    }
-    if plan.is_day_off {
-        return Err(AppError::invalid("A day marked off has no active plan to edit."));
-    }
-
-    let existing = list_commitments(tx, plan.id)?;
+) -> AppResult<(DailyPlan, Vec<Commitment>, RevisionImpact)> {
+    let (plan, existing, prepared_steps, impact) = prepare_revision(tx, input)?;
     let existing_by_id: HashMap<i64, &Commitment> =
         existing.iter().map(|commitment| (commitment.id, commitment)).collect();
-    let mut submitted_ids = HashSet::new();
-    for item in &input.commitments {
-        let Some(id) = item.id else {
-            continue;
-        };
-        let Some(current) = existing_by_id.get(&id) else {
-            return Err(AppError::invalid(
-                "One of those commitments does not belong to today's plan.",
-            ));
-        };
-        if !submitted_ids.insert(id) {
-            return Err(AppError::invalid(
-                "The revised plan contains the same commitment more than once.",
-            ));
-        }
-        if current.task_id != item.commitment.task_id {
-            return Err(AppError::invalid(
-                "An existing commitment cannot be linked to a different backlog task.",
-            ));
-        }
-    }
-
+    let submitted_ids = input
+        .commitments
+        .iter()
+        .filter_map(|item| item.id)
+        .collect::<HashSet<_>>();
     let removed = existing
         .iter()
         .filter(|commitment| !submitted_ids.contains(&commitment.id))
         .collect::<Vec<_>>();
-    if removed
-        .iter()
-        .any(|commitment| commitment.status != "pending" || commitment.started_at.is_some())
-    {
-        return Err(AppError::invalid(
-            "Started, completed, or otherwise closed commitments must stay in today's record. You can still edit their details.",
-        ));
-    }
 
     tx.execute(
         "UPDATE daily_plans SET likely_distraction=?1, countermeasure=?2,
@@ -492,7 +540,11 @@ pub fn revise_day(
         }
     }
 
-    Ok((get_plan(tx, plan.id)?, list_commitments(tx, plan.id)?))
+    Ok((
+        get_plan(tx, plan.id)?,
+        list_commitments(tx, plan.id)?,
+        impact,
+    ))
 }
 
 /// Mark today as off / vacation (spec §5).
@@ -766,7 +818,7 @@ mod tests {
             interview_answers: serde_json::json!({"revised": true}),
         };
 
-        let (_, revised) = {
+        let (_, revised, impact) = {
             let tx = conn.transaction().unwrap();
             let result = revise_day(&tx, &revision).unwrap();
             tx.commit().unwrap();
@@ -787,6 +839,7 @@ mod tests {
         ));
         assert_ne!(revised[1].id, kept_id);
         assert_eq!(revised[1].status, "pending");
+        assert_eq!(impact.semantic_commitment_ids, vec![kept_id]);
     }
 
     #[test]

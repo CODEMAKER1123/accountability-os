@@ -10,7 +10,7 @@ use aos_core::classify::{cache_key, ClassificationPipeline, CorrectionMatcher, P
 use aos_core::events::{AppEvent, MonitoringState};
 use aos_core::types::{
     ActivityContext, ActivitySample, Classification, ClassificationSource, ClassifyOutcome,
-    SessionDraft,
+    SessionDraft, PLANNED_BREAK_REASON,
 };
 
 use crate::db::{self, engine_data, local_minutes_now, plans, rules, sessions, today_local};
@@ -266,7 +266,7 @@ fn tick(app: &tauri::AppHandle, reading: ProbeReading, demo_mode: bool) {
                         ctx.browser_domain.as_deref(),
                         &ctx.window_title,
                     );
-                    let outcome = if on_break && !draft_is_idle {
+                    let outcome = if on_break {
                         // Planned breaks are not distractions and not work:
                         // break time is idle-class for scoring (spec §17),
                         // and it never reaches the AI.
@@ -390,7 +390,7 @@ fn break_outcome() -> ClassifyOutcome {
         classification: Classification::Idle,
         confidence: 1.0,
         source: ClassificationSource::Rule,
-        reason: "Planned break".into(),
+        reason: PLANNED_BREAK_REASON.into(),
     }
 }
 
@@ -438,7 +438,7 @@ fn store_finished_session(app: &tauri::AppHandle, draft: SessionDraft, sctx: Ses
 
     // Time on a planned break is stored as such — never scored, never sent
     // to the AI (spec §17).
-    if sctx.on_break && !draft.is_idle {
+    if sctx.on_break {
         let stored = state
             .db
             .with(|conn| {
