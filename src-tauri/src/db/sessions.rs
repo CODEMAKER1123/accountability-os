@@ -31,6 +31,19 @@ fn session_from_row(row: &Row) -> rusqlite::Result<ActivitySessionRow> {
     })
 }
 
+/// Remove the legacy cache key plus every semantic-versioned variant. The
+/// base key can contain user-controlled title characters, so use `substr`
+/// instead of treating it as a LIKE/GLOB pattern.
+fn delete_cache_key_variants(conn: &Connection, key: &str) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM classification_cache
+         WHERE cache_key=?1
+            OR substr(cache_key, 1, length(?1) + 2) = ?1 || '|s'",
+        [key],
+    )?;
+    Ok(())
+}
+
 /// Insert a session, splitting it at local-midnight boundaries so each
 /// day's totals only ever count time that belongs to that local date.
 /// Returns every inserted segment id (chronological order) — a pending-AI
@@ -216,7 +229,7 @@ pub fn apply_correction(conn: &Connection, rec: &CorrectionRecord) -> AppResult<
         session.browser_domain.as_deref(),
         &session.window_title,
     );
-    conn.execute("DELETE FROM classification_cache WHERE cache_key=?1", [key])?;
+    delete_cache_key_variants(conn, &key)?;
     get(conn, rec.session_id)
 }
 
@@ -439,7 +452,43 @@ fn delete_cache_for_sessions<P: rusqlite::Params>(
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for key in keys {
-        conn.execute("DELETE FROM classification_cache WHERE cache_key=?1", [key])?;
+        delete_cache_key_variants(conn, &key)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleting_a_base_cache_key_removes_semantic_variants_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE classification_cache(cache_key TEXT PRIMARY KEY);
+             INSERT INTO classification_cache(cache_key) VALUES
+               ('c42|peditor|d|tbrief'),
+               ('c42|peditor|d|tbrief|s0123456789abcdef'),
+               ('c42|peditor|d|tbriefing|s0123456789abcdef'),
+               ('c43|peditor|d|tbrief|s0123456789abcdef');",
+        )
+        .unwrap();
+
+        delete_cache_key_variants(&conn, "c42|peditor|d|tbrief").unwrap();
+
+        let remaining = conn
+            .prepare("SELECT cache_key FROM classification_cache ORDER BY cache_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                "c42|peditor|d|tbriefing|s0123456789abcdef",
+                "c43|peditor|d|tbrief|s0123456789abcdef"
+            ]
+        );
+    }
 }

@@ -83,10 +83,10 @@ pub fn revise_day(
             .map(|id| format!("c{id}|"))
             .collect::<Vec<_>>();
         let mut engine = state.engine.lock();
-        // An in-flight answer was prompted with the old title/definition.
-        // Cancel it before the durable cache is cleared so it cannot restore
-        // a stale answer after this edit.
-        state.invalidate_activity_tasks_with_engine(&mut engine);
+        // New classifications use a semantic-versioned key. Dropping the old
+        // hot-cache entries forces the revised context down that path while
+        // allowing the just-flushed historical session's old-context AI task
+        // to finish and classify that pre-edit time truthfully.
         engine
             .classification_cache
             .retain(|key, _| !prefixes.iter().any(|prefix| key.starts_with(prefix)));
@@ -100,9 +100,6 @@ pub fn revise_day(
                     [format!("c{id}|%")],
                 )?;
             }
-            // The generation boundary above cancels every in-flight task.
-            // Do not leave its placeholder sessions stuck as pending.
-            tx.execute("UPDATE activity_sessions SET pending_ai=0 WHERE pending_ai=1", [])?;
         }
         Ok(result)
     })?;
