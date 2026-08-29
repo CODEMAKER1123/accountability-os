@@ -44,9 +44,8 @@ export function reduceDownloadProgress(
 }
 
 export async function checkForAppUpdate(force = false): Promise<Update | null> {
-  if (!force && readyUpdate) return readyUpdate;
   if (pendingCheck) return pendingCheck;
-  if (!force && Date.now() - lastCheckedAt < MIN_CHECK_INTERVAL_MS) return null;
+  if (!force && Date.now() - lastCheckedAt < MIN_CHECK_INTERVAL_MS) return readyUpdate;
 
   // Count failed/offline attempts too, otherwise repeatedly focusing the app
   // could hammer the update endpoint while the network is unavailable.

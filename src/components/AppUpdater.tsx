@@ -26,10 +26,14 @@ export default function AppUpdater() {
     const checkNow = async () => {
       try {
         const available = await checkForAppUpdate();
-        if (mounted.current && available) {
-          setUpdate(available);
+        if (!mounted.current) return;
+        setUpdate(available);
+        if (available) {
           setFailure(null);
           setPhase((current) => (current === "failed" ? "ready" : current));
+        } else {
+          setFailure(null);
+          setPhase("ready");
         }
       } catch (error) {
         // Startup checks stay quiet while offline. The next background check

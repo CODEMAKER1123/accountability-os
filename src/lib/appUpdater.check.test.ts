@@ -65,6 +65,18 @@ describe("app update checks", () => {
     expect(updaterMocks.check).toHaveBeenCalledTimes(2);
   });
 
+  it("refreshes cached metadata after the check interval expires", async () => {
+    const firstUpdate = { version: "0.2.0" } as never;
+    const replacementUpdate = { version: "0.2.1" } as never;
+    updaterMocks.check.mockResolvedValueOnce(firstUpdate).mockResolvedValueOnce(replacementUpdate);
+    const { checkForAppUpdate } = await import("./appUpdater");
+
+    await expect(checkForAppUpdate()).resolves.toBe(firstUpdate);
+    vi.advanceTimersByTime(5 * 60_000);
+    await expect(checkForAppUpdate()).resolves.toBe(replacementUpdate);
+    expect(updaterMocks.check).toHaveBeenCalledTimes(2);
+  });
+
   it("invalidates a failed download so the next check gets fresh metadata", async () => {
     const failedUpdate = { version: "0.2.0" } as never;
     const replacementUpdate = { version: "0.2.1" } as never;
