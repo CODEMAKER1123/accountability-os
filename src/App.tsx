@@ -149,7 +149,7 @@ export default function App() {
 
       {/* Modals */}
       {modal?.kind === "onboarding" && <Onboarding />}
-      {modal?.kind === "interview" && <Interview />}
+      {modal?.kind === "interview" && <Interview mode={modal.mode ?? "new"} />}
       {modal?.kind === "review" && <ReviewModal />}
       {modal?.kind === "switch" && (
         <SwitchModal

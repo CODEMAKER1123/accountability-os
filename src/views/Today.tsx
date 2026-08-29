@@ -7,7 +7,7 @@ import { ClassBadge, ErrorBanner, PriorityTag, ProgressBar, ScoreRing } from "@/
 import { CommitmentSteps } from "@/components/CommitmentSteps";
 import { api, errorMessage, type Commitment } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
-import { fmtClockDuration, fmtDuration, fmtTime } from "@/lib/time";
+import { fmtClockDuration, fmtDuration, fmtMinOfDay, fmtTime } from "@/lib/time";
 
 export default function Today() {
   const { snapshot, refreshSnapshot, setModal } = useStore();
@@ -67,9 +67,17 @@ export default function Today() {
             </button>
           )}
           {planLocked && !dayEnded && (
-            <button className="btn" onClick={() => setModal({ kind: "review" })}>
-              End day
-            </button>
+            <>
+              <button
+                className="btn"
+                onClick={() => setModal({ kind: "interview", mode: "edit" })}
+              >
+                Edit plan
+              </button>
+              <button className="btn" onClick={() => setModal({ kind: "review" })}>
+                End day
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -133,7 +141,8 @@ export default function Today() {
           <p className="section-title">Today's commitments</p>
           {!active && !dayEnded && pending.length > 0 && (
             <p className="mb-3 mt-1 text-xs text-ink-400">
-              Choose one commitment to begin a focus session.
+              Focus is paused. Activity monitoring still records your workday; choose a
+              commitment to resume focused tracking.
             </p>
           )}
           <div className="space-y-2">
@@ -205,15 +214,24 @@ export default function Today() {
             Next check-in {fmtTime(snapshot.next_checkin_at)}
             {snapshot.extension_connected && " · browser extension connected"}
           </p>
+          <p className="mt-1 text-2xs text-ink-500">
+            Work hours {fmtMinOfDay(snapshot.work_hours.start_min)}–
+            {fmtMinOfDay(snapshot.work_hours.end_min)} · tracked{" "}
+            {fmtDuration(snapshot.work_hours.tracked_secs)} · untracked gap{" "}
+            {fmtDuration(snapshot.work_hours.gap_secs)}. Monitoring continues when a task is
+            paused.
+          </p>
         </div>
 
         <div className="card flex flex-col items-center justify-center gap-3">
-          <div className="flex gap-5">
+          <div className="flex gap-3">
+            <ScoreRing value={snapshot.work_hours.productivity} label="Productivity" />
             <ScoreRing value={snapshot.score.alignment} label="Alignment" />
             <ScoreRing value={snapshot.score.focus_quality} label="Focus" />
           </div>
           <p className="text-center text-2xs leading-relaxed text-ink-500">
-            Alignment = (focused + 0.7×supporting) ÷ non-idle time.
+            Productivity includes idle time to reveal workday gaps; alignment measures whether
+            non-idle activity matched your commitment.
           </p>
         </div>
       </div>

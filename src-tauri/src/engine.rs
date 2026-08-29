@@ -10,7 +10,7 @@ use aos_core::classify::{cache_key, ClassificationPipeline, CorrectionMatcher, P
 use aos_core::events::{AppEvent, MonitoringState};
 use aos_core::types::{
     ActivityContext, ActivitySample, Classification, ClassificationSource, ClassifyOutcome,
-    SessionDraft,
+    SessionDraft, PLANNED_BREAK_REASON,
 };
 
 use crate::db::{self, engine_data, local_minutes_now, plans, rules, sessions, today_local};
@@ -18,6 +18,41 @@ use crate::monitor::{demo::DemoProbe, is_browser_process, os_probe, ActivityProb
 use crate::state::{ActiveCommitment, AppState, CurrentActivity};
 
 pub const POLL_INTERVAL_SECS: u64 = 3;
+
+/// AI answers depend on the commitment wording as well as its row ID. Keep a
+/// stable semantic version in the key so a revised outcome cannot reuse an
+/// answer prompted with its previous title or definition of done.
+fn activity_cache_key(
+    commitment: Option<&ActiveCommitment>,
+    process_name: &str,
+    browser_domain: Option<&str>,
+    window_title: &str,
+) -> String {
+    let base = cache_key(
+        commitment.map(|item| item.id),
+        process_name,
+        browser_domain,
+        window_title,
+    );
+    let Some(commitment) = commitment else {
+        return base;
+    };
+
+    // FNV-1a is deliberately simple and stable across app versions. This is
+    // a cache namespace, not a security boundary; the full private wording is
+    // never stored in the key.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for text in [&commitment.title, &commitment.done_definition] {
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        for byte in normalized.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{base}|s{hash:016x}")
+}
 
 pub fn emit_event(app: &tauri::AppHandle, event: &AppEvent) {
     if let Err(e) = app.emit("app-event", event) {
@@ -260,13 +295,13 @@ fn tick(app: &tauri::AppHandle, reading: ProbeReading, demo_mode: bool) {
                         in_focus_session: engine.focus_session_id.is_some(),
                         is_idle: draft_is_idle,
                     };
-                    let key = cache_key(
-                        ctx.commitment_id,
+                    let key = activity_cache_key(
+                        engine.active_commitment.as_ref(),
                         &ctx.process_name,
                         ctx.browser_domain.as_deref(),
                         &ctx.window_title,
                     );
-                    let outcome = if on_break && !draft_is_idle {
+                    let outcome = if on_break {
                         // Planned breaks are not distractions and not work:
                         // break time is idle-class for scoring (spec §17),
                         // and it never reaches the AI.
@@ -390,7 +425,7 @@ fn break_outcome() -> ClassifyOutcome {
         classification: Classification::Idle,
         confidence: 1.0,
         source: ClassificationSource::Rule,
-        reason: "Planned break".into(),
+        reason: PLANNED_BREAK_REASON.into(),
     }
 }
 
@@ -438,7 +473,7 @@ fn store_finished_session(app: &tauri::AppHandle, draft: SessionDraft, sctx: Ses
 
     // Time on a planned break is stored as such — never scored, never sent
     // to the AI (spec §17).
-    if sctx.on_break && !draft.is_idle {
+    if sctx.on_break {
         let stored = state
             .db
             .with(|conn| {
@@ -468,8 +503,8 @@ fn store_finished_session(app: &tauri::AppHandle, draft: SessionDraft, sctx: Ses
         in_focus_session: sctx.in_focus,
         is_idle: draft.is_idle,
     };
-    let key = cache_key(
-        ctx.commitment_id,
+    let key = activity_cache_key(
+        sctx.commitment.as_ref(),
         &ctx.process_name,
         ctx.browser_domain.as_deref(),
         &ctx.window_title,
@@ -737,10 +772,10 @@ fn spawn_ai_classification(
             if cached_in_db {
                 engine.classification_cache.insert(key.clone(), outcome.clone());
             }
-            let commitment_id = engine.active_commitment.as_ref().map(|c| c.id);
+            let active_commitment = engine.active_commitment.clone();
             if let Some(current) = &mut engine.current_activity {
-                let current_key = cache_key(
-                    commitment_id,
+                let current_key = activity_cache_key(
+                    active_commitment.as_ref(),
                     &current.process_name,
                     current.browser_domain.as_deref(),
                     &current.window_title,
@@ -1383,9 +1418,37 @@ pub fn restore(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::reset_rejected_distraction;
+    use super::{activity_cache_key, reset_rejected_distraction};
     use aos_core::accountability::{DistractionConfig, DistractionSignal, DistractionTracker};
     use aos_core::types::Classification;
+    use crate::state::ActiveCommitment;
+
+    #[test]
+    fn activity_cache_key_tracks_commitment_semantics_without_storing_them() {
+        let original = ActiveCommitment {
+            id: 42,
+            title: "Publish the brief".into(),
+            done_definition: "The approved brief is published.".into(),
+            project_id: None,
+        };
+        let cosmetic = ActiveCommitment {
+            title: "  PUBLISH   THE brief ".into(),
+            done_definition: "the approved brief is published.".into(),
+            ..original.clone()
+        };
+        let revised = ActiveCommitment {
+            done_definition: "The approved brief is published and emailed.".into(),
+            ..original.clone()
+        };
+
+        let first = activity_cache_key(Some(&original), "editor.exe", None, "Brief");
+        let same = activity_cache_key(Some(&cosmetic), "editor.exe", None, "Brief");
+        let changed = activity_cache_key(Some(&revised), "editor.exe", None, "Brief");
+
+        assert_eq!(first, same);
+        assert_ne!(first, changed);
+        assert!(!first.contains("Publish the brief"));
+    }
 
     #[test]
     fn rejected_prompt_signal_resets_tracker_without_touching_recovery_events() {

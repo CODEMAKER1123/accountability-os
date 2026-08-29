@@ -109,6 +109,7 @@ pub fn run() {
             commands::get_today_plan,
             commands::get_plan_for_date,
             commands::lock_day,
+            commands::revise_day,
             commands::mark_day_off,
             commands::snooze_interview,
             commands::commitment_limit_check,

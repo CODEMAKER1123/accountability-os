@@ -7,6 +7,7 @@ import {
   api,
   errorMessage,
   type BreakdownDetail,
+  type Commitment,
   type MorningCoach,
   type Priority,
   type Task,
@@ -45,18 +46,46 @@ type Step =
   | "coach"
   | "contract";
 
-export default function Interview() {
-  const { setModal, refreshSnapshot, settings } = useStore();
-  const [step, setStep] = useState<Step>("intro");
-  const [mustBeTrue, setMustBeTrue] = useState("");
-  const [candidates, setCandidates] = useState<Candidate[]>([]);
+function candidateFromCommitment(commitment: Commitment): Candidate {
+  return {
+    key: `commitment-${commitment.id}`,
+    source: "q1",
+    title: commitment.title,
+    commitment_id: commitment.id,
+    task_id: commitment.task_id,
+    selected: true,
+    priority: commitment.priority,
+    done_definition: commitment.done_definition,
+    estimated_minutes: commitment.estimated_minutes,
+    steps: commitment.steps.map((step) => step.title),
+  };
+}
+
+export default function Interview({ mode = "new" }: { mode?: "new" | "edit" }) {
+  const { setModal, refreshSnapshot, settings, snapshot } = useStore();
+  const editing = mode === "edit";
+  const currentPlan = editing ? snapshot?.plan ?? null : null;
+  const scheduledWhen = currentPlan?.most_important_when ?? "now";
+  const [step, setStep] = useState<Step>(editing ? "q2" : "intro");
+  const [mustBeTrue, setMustBeTrue] = useState(() =>
+    editing ? (snapshot?.commitments ?? []).map((commitment) => commitment.title).join("\n") : "",
+  );
+  const [candidates, setCandidates] = useState<Candidate[]>(() =>
+    editing ? (snapshot?.commitments ?? []).map(candidateFromCommitment) : [],
+  );
   const [customTitle, setCustomTitle] = useState("");
   const [backlog, setBacklog] = useState<Task[]>([]);
   const [limitMessage, setLimitMessage] = useState<string | null>(null);
-  const [likelyDistraction, setLikelyDistraction] = useState("");
-  const [countermeasure, setCountermeasure] = useState("");
-  const [whenMostImportant, setWhenMostImportant] = useState("now");
-  const [specificTime, setSpecificTime] = useState("09:00");
+  const [likelyDistraction, setLikelyDistraction] = useState(
+    currentPlan?.likely_distraction ?? "",
+  );
+  const [countermeasure, setCountermeasure] = useState(currentPlan?.countermeasure ?? "");
+  const [whenMostImportant, setWhenMostImportant] = useState(
+    scheduledWhen.startsWith("specific:") ? "specific" : scheduledWhen,
+  );
+  const [specificTime, setSpecificTime] = useState(
+    scheduledWhen.startsWith("specific:") ? scheduledWhen.slice("specific:".length) : "09:00",
+  );
   const [coach, setCoach] = useState<MorningCoach | null>(null);
   const [coachLoading, setCoachLoading] = useState(false);
   const [breakdownDetail, setBreakdownDetail] = useState<BreakdownDetail>("standard");
@@ -71,8 +100,30 @@ export default function Interview() {
   }, []);
 
   const selected = useMemo(() => candidates.filter((c) => c.selected), [candidates]);
+  const protectedCommitmentIds = useMemo(
+    () =>
+      new Set(
+        (snapshot?.commitments ?? [])
+          .filter(
+            (commitment) =>
+              commitment.status !== "pending" || commitment.started_at != null,
+          )
+          .map((commitment) => commitment.id),
+      ),
+    [snapshot?.commitments],
+  );
 
   const toggleCandidate = async (key: string) => {
+    const candidate = candidates.find((item) => item.key === key);
+    if (
+      editing &&
+      candidate?.selected &&
+      candidate.commitment_id != null &&
+      protectedCommitmentIds.has(candidate.commitment_id)
+    ) {
+      setLimitMessage("Started or completed commitments stay in today's accountability record.");
+      return;
+    }
     const next = candidates.map((c) => (c.key === key ? { ...c, selected: !c.selected } : c));
     setCandidates(next);
     const count = next.filter((c) => c.selected).length;
@@ -81,7 +132,30 @@ export default function Interview() {
 
   const addFromQ1 = () => {
     breakdownRevision.current += 1;
-    setCandidates((prev) => reconcileQuestionOneCandidates(prev, mustBeTrue));
+    const reconciled = reconcileQuestionOneCandidates(candidates, mustBeTrue);
+    if (!editing) {
+      setCandidates(reconciled);
+      setLimitMessage(null);
+      setStep("q2");
+      return;
+    }
+    const retainedIds = new Set(
+      reconciled.map((candidate) => candidate.commitment_id).filter((id) => id != null),
+    );
+    const protectedMissing = candidates.filter(
+      (candidate) =>
+        candidate.commitment_id != null &&
+        protectedCommitmentIds.has(candidate.commitment_id) &&
+        !retainedIds.has(candidate.commitment_id),
+    );
+    if (protectedMissing.length > 0) {
+      setLimitMessage(
+        "Started or completed commitments were kept so their accountability history stays intact.",
+      );
+    } else {
+      setLimitMessage(null);
+    }
+    setCandidates([...reconciled, ...protectedMissing]);
     setStep("q2");
   };
 
@@ -97,6 +171,7 @@ export default function Interview() {
         key: `custom-${Date.now()}`,
         source: "custom",
         title: customTitle.trim(),
+        commitment_id: null,
         task_id: null,
         selected: prev.filter((c) => c.selected).length < 3,
         priority: "must",
@@ -116,6 +191,7 @@ export default function Interview() {
         key: `task-${t.id}`,
         source: "backlog",
         title: t.title,
+        commitment_id: null,
         task_id: t.id,
         selected: prev.filter((c) => c.selected).length < 3,
         priority: t.priority,
@@ -184,13 +260,14 @@ export default function Interview() {
     }
   };
 
-  const lockDay = async () => {
+  const saveDay = async () => {
     setLocking(true);
     setError(null);
     try {
-      await api.lockDay({
+      const input = {
         date: todayISO(),
         commitments: selected.map((c) => ({
+          ...(editing ? { id: c.commitment_id } : {}),
           task_id: c.task_id,
           title: c.title,
           done_definition: c.done_definition,
@@ -203,7 +280,23 @@ export default function Interview() {
         most_important_when:
           whenMostImportant === "specific" ? `specific:${specificTime}` : whenMostImportant,
         interview_answers: { must_be_true: mustBeTrue },
-      });
+      };
+      if (editing) {
+        await api.reviseDay({
+          ...input,
+          commitments: selected.map((c) => ({
+            id: c.commitment_id,
+            task_id: c.task_id,
+            title: c.title,
+            done_definition: c.done_definition,
+            estimated_minutes: c.estimated_minutes,
+            priority: c.priority,
+            steps: c.steps.map((actionStep) => actionStep.trim()).filter(Boolean),
+          })),
+        });
+      } else {
+        await api.lockDay(input);
+      }
       await refreshSnapshot();
       setModal(null);
     } catch (e) {
@@ -232,12 +325,28 @@ export default function Interview() {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
       <div className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
         <div className="flex items-center justify-between border-b border-ink-700 px-5 py-3">
-          <p className="text-sm font-semibold text-ink-50">Daily Planning Interview</p>
-          {step !== "intro" && (
-            <p className="text-2xs text-ink-500">
-              {selected.length > 0 && `${selected.length} commitment${selected.length > 1 ? "s" : ""} selected`}
+          <div>
+            <p className="text-sm font-semibold text-ink-50">
+              {editing ? "Edit Today's Plan" : "Daily Planning Interview"}
             </p>
-          )}
+            {editing && (
+              <p className="text-2xs text-ink-500">
+                Progress and focus history stay attached while you revise.
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            {step !== "intro" && (
+              <p className="text-2xs text-ink-500">
+                {selected.length > 0 && `${selected.length} commitment${selected.length > 1 ? "s" : ""} selected`}
+              </p>
+            )}
+            {editing && (
+              <button className="btn py-1 text-2xs" onClick={() => setModal(null)}>
+                Cancel
+              </button>
+            )}
+          </div>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
           {step === "intro" && (
@@ -305,9 +414,19 @@ export default function Interview() {
                       type="checkbox"
                       className="h-3.5 w-3.5 accent-[#5b8def]"
                       checked={c.selected}
+                      disabled={
+                        editing &&
+                        c.commitment_id != null &&
+                        protectedCommitmentIds.has(c.commitment_id)
+                      }
                       onChange={() => void toggleCandidate(c.key)}
                     />
                     <span className="min-w-0 flex-1 truncate text-[13px] text-ink-100">{c.title}</span>
+                    {editing &&
+                      c.commitment_id != null &&
+                      protectedCommitmentIds.has(c.commitment_id) && (
+                        <span className="text-2xs text-ink-500">progress kept</span>
+                      )}
                     {c.task_id != null && <span className="text-2xs text-ink-500">backlog</span>}
                   </label>
                 ))}
@@ -626,7 +745,17 @@ export default function Interview() {
 
           {step === "contract" && (
             <div className="space-y-4">
-              <p className="section-title">Today's contract</p>
+              <div>
+                <p className="section-title">
+                  {editing ? "Revised contract" : "Today's contract"}
+                </p>
+                {editing && (
+                  <p className="mt-1 text-2xs text-ink-500">
+                    Saving keeps started and completed commitments, focus sessions, and checked
+                    steps in place.
+                  </p>
+                )}
+              </div>
               <ol className="space-y-2">
                 {selected.map((c, i) => (
                   <li key={c.key} className="flex items-start gap-3 rounded-md border border-ink-700 bg-ink-850 px-3 py-2">
@@ -668,8 +797,14 @@ export default function Interview() {
                 <button className="btn" onClick={() => setStep("coach")}>
                   Back
                 </button>
-                <button className="btn btn-primary px-6 py-2 text-sm" onClick={() => void lockDay()} disabled={locking}>
-                  {locking ? "Locking…" : "LOCK MY DAY"}
+                <button className="btn btn-primary px-6 py-2 text-sm" onClick={() => void saveDay()} disabled={locking}>
+                  {locking
+                    ? editing
+                      ? "Saving…"
+                      : "Locking…"
+                    : editing
+                      ? "SAVE REVISED PLAN"
+                      : "LOCK MY DAY"}
                 </button>
               </div>
             </div>

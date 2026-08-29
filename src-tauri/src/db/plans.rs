@@ -2,6 +2,7 @@
 
 use rusqlite::{params, Connection, Row};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 
 use super::models::{Commitment, CommitmentStep, DailyPlan};
 use super::now;
@@ -90,6 +91,56 @@ pub struct LockDayInput {
     pub interview_answers: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviseCommitmentInput {
+    pub id: Option<i64>,
+    #[serde(flatten)]
+    pub commitment: CommitmentInput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviseDayInput {
+    pub date: String,
+    pub commitments: Vec<ReviseCommitmentInput>,
+    #[serde(default)]
+    pub likely_distraction: String,
+    #[serde(default)]
+    pub countermeasure: String,
+    #[serde(default = "default_when")]
+    pub most_important_when: String,
+    #[serde(default)]
+    pub interview_answers: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevisionImpact {
+    /// Existing commitments whose AI classification context changed.
+    pub semantic_commitment_ids: Vec<i64>,
+}
+
+impl RevisionImpact {
+    pub fn semantics_changed(&self) -> bool {
+        !self.semantic_commitment_ids.is_empty()
+    }
+}
+
+impl ReviseDayInput {
+    fn validation_input(&self) -> LockDayInput {
+        LockDayInput {
+            date: self.date.clone(),
+            commitments: self
+                .commitments
+                .iter()
+                .map(|item| item.commitment.clone())
+                .collect(),
+            likely_distraction: self.likely_distraction.clone(),
+            countermeasure: self.countermeasure.clone(),
+            most_important_when: self.most_important_when.clone(),
+            interview_answers: self.interview_answers.clone(),
+        }
+    }
+}
+
 fn default_when() -> String {
     "flexible".into()
 }
@@ -122,12 +173,13 @@ fn validated_step_titles(steps: &[String]) -> AppResult<Vec<String>> {
     Ok(validated)
 }
 
-/// Create + lock the daily plan (spec §6 "LOCK MY DAY").
-pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(DailyPlan, Vec<Commitment>)> {
+fn validate_day_input(input: &LockDayInput) -> AppResult<Vec<Vec<String>>> {
     chrono::NaiveDate::parse_from_str(&input.date, "%Y-%m-%d")
         .map_err(|_| AppError::invalid("Plan date must use YYYY-MM-DD."))?;
     if input.commitments.is_empty() {
-        return Err(AppError::invalid("Commit to at least one outcome before locking the day."));
+        return Err(AppError::invalid(
+            "Commit to at least one outcome before locking the day.",
+        ));
     }
     if let Some(msg) = too_many_commitments_message(input.commitments.len()) {
         return Err(AppError::Invalid(msg));
@@ -148,7 +200,9 @@ pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(
             return Err(AppError::invalid("Every commitment needs a title."));
         }
         if c.title.trim().chars().count() > 300 {
-            return Err(AppError::invalid("Commitment titles must be 300 characters or fewer."));
+            return Err(AppError::invalid(
+                "Commitment titles must be 300 characters or fewer.",
+            ));
         }
         if c.done_definition.trim().len() < 10 {
             return Err(AppError::invalid(format!(
@@ -157,12 +211,20 @@ pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(
             )));
         }
         if c.done_definition.trim().chars().count() > 2_000 {
-            return Err(AppError::invalid("Definitions of done must be 2,000 characters or fewer."));
+            return Err(AppError::invalid(
+                "Definitions of done must be 2,000 characters or fewer.",
+            ));
         }
         if !matches!(c.priority.as_str(), "must" | "should" | "could") {
-            return Err(AppError::invalid(format!("Invalid commitment priority: {}", c.priority)));
+            return Err(AppError::invalid(format!(
+                "Invalid commitment priority: {}",
+                c.priority
+            )));
         }
-        if c.estimated_minutes.is_some_and(|minutes| !(1..=24 * 60).contains(&minutes)) {
+        if c
+            .estimated_minutes
+            .is_some_and(|minutes| !(1..=24 * 60).contains(&minutes))
+        {
             return Err(AppError::invalid(
                 "Commitment estimates must be between 1 minute and 24 hours.",
             ));
@@ -177,8 +239,99 @@ pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(
         .strip_prefix("specific:")
         .is_some_and(|time| chrono::NaiveTime::parse_from_str(time, "%H:%M").is_ok());
     if !valid_when {
-        return Err(AppError::invalid("Invalid time for the most important commitment."));
+        return Err(AppError::invalid(
+            "Invalid time for the most important commitment.",
+        ));
     }
+    Ok(prepared_steps)
+}
+
+fn normalized_step_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn prepare_revision(
+    conn: &Connection,
+    input: &ReviseDayInput,
+) -> AppResult<(DailyPlan, Vec<Commitment>, Vec<Vec<String>>, RevisionImpact)> {
+    let validation_input = input.validation_input();
+    let prepared_steps = validate_day_input(&validation_input)?;
+    let plan = get_plan_by_date(conn, &input.date)?
+        .ok_or_else(|| AppError::invalid("There is no plan to edit for this day."))?;
+    if plan.locked_at.is_none() {
+        return Err(AppError::invalid("This day is not locked yet. Lock it instead."));
+    }
+    if plan.ended_at.is_some() {
+        return Err(AppError::invalid("A completed day can no longer be edited."));
+    }
+    if plan.is_day_off {
+        return Err(AppError::invalid("A day marked off has no active plan to edit."));
+    }
+
+    let existing = list_commitments(conn, plan.id)?;
+    let existing_by_id: HashMap<i64, &Commitment> =
+        existing.iter().map(|commitment| (commitment.id, commitment)).collect();
+    let mut submitted_ids = HashSet::new();
+    let mut semantic_commitment_ids = Vec::new();
+    for item in &input.commitments {
+        let Some(id) = item.id else {
+            continue;
+        };
+        let Some(current) = existing_by_id.get(&id) else {
+            return Err(AppError::invalid(
+                "One of those commitments does not belong to today's plan.",
+            ));
+        };
+        if !submitted_ids.insert(id) {
+            return Err(AppError::invalid(
+                "The revised plan contains the same commitment more than once.",
+            ));
+        }
+        if current.task_id != item.commitment.task_id {
+            return Err(AppError::invalid(
+                "An existing commitment cannot be linked to a different backlog task.",
+            ));
+        }
+        if current.title != item.commitment.title.trim()
+            || current.done_definition != item.commitment.done_definition.trim()
+        {
+            semantic_commitment_ids.push(id);
+        }
+    }
+
+    if existing.iter().any(|commitment| {
+        !submitted_ids.contains(&commitment.id)
+            && (commitment.status != "pending" || commitment.started_at.is_some())
+    }) {
+        return Err(AppError::invalid(
+            "Started, completed, or otherwise closed commitments must stay in today's record. You can still edit their details.",
+        ));
+    }
+
+    Ok((
+        plan,
+        existing,
+        prepared_steps,
+        RevisionImpact {
+            semantic_commitment_ids,
+        },
+    ))
+}
+
+/// Validate a proposed revision without mutating the plan. Commands use this
+/// before flushing the open activity boundary so rejected edits are no-ops.
+pub fn validate_revision(conn: &Connection, input: &ReviseDayInput) -> AppResult<RevisionImpact> {
+    let (_, _, _, impact) = prepare_revision(conn, input)?;
+    Ok(impact)
+}
+
+/// Create + lock the daily plan (spec §6 "LOCK MY DAY").
+pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(DailyPlan, Vec<Commitment>)> {
+    let prepared_steps = validate_day_input(input)?;
 
     let ts = now();
     let existing = get_plan_by_date(tx, &input.date)?;
@@ -263,6 +416,135 @@ pub fn lock_day(tx: &rusqlite::Transaction, input: &LockDayInput) -> AppResult<(
     let plan = get_plan(tx, plan_id)?;
     let commitments = list_commitments(tx, plan_id)?;
     Ok((plan, commitments))
+}
+
+/// Safely revise a locked day without replacing rows that already own focus
+/// history, outcomes, or checked action steps.
+pub fn revise_day(
+    tx: &rusqlite::Transaction,
+    input: &ReviseDayInput,
+) -> AppResult<(DailyPlan, Vec<Commitment>, RevisionImpact)> {
+    let (plan, existing, prepared_steps, impact) = prepare_revision(tx, input)?;
+    let existing_by_id: HashMap<i64, &Commitment> =
+        existing.iter().map(|commitment| (commitment.id, commitment)).collect();
+    let submitted_ids = input
+        .commitments
+        .iter()
+        .filter_map(|item| item.id)
+        .collect::<HashSet<_>>();
+    let removed = existing
+        .iter()
+        .filter(|commitment| !submitted_ids.contains(&commitment.id))
+        .collect::<Vec<_>>();
+
+    tx.execute(
+        "UPDATE daily_plans SET likely_distraction=?1, countermeasure=?2,
+                most_important_when=?3, interview_answers=?4 WHERE id=?5",
+        params![
+            input.likely_distraction.trim(),
+            input.countermeasure.trim(),
+            input.most_important_when,
+            serde_json::to_string(&input.interview_answers)?,
+            plan.id
+        ],
+    )?;
+
+    for commitment in removed {
+        tx.execute("DELETE FROM daily_commitments WHERE id=?1", [commitment.id])?;
+        if let Some(task_id) = commitment.task_id {
+            tx.execute(
+                "UPDATE tasks SET status='planned'
+                 WHERE id=?1 AND status='committed' AND NOT EXISTS(
+                   SELECT 1 FROM daily_commitments
+                   WHERE task_id=?1 AND status IN ('pending','active')
+                 )",
+                [task_id],
+            )?;
+        }
+    }
+
+    let ts = now();
+    for (index, (item, step_titles)) in input
+        .commitments
+        .iter()
+        .zip(prepared_steps.iter())
+        .enumerate()
+    {
+        let rank = (index + 1) as i64;
+        match item.id {
+            Some(id) => {
+                let current = existing_by_id[&id];
+                let completed_steps: HashMap<String, bool> = current
+                    .steps
+                    .iter()
+                    .map(|step| (normalized_step_title(&step.title), step.completed))
+                    .collect();
+                let steps = step_titles
+                    .iter()
+                    .map(|title| CommitmentStep {
+                        title: title.clone(),
+                        completed: completed_steps
+                            .get(&normalized_step_title(title))
+                            .copied()
+                            .unwrap_or(false),
+                    })
+                    .collect::<Vec<_>>();
+                tx.execute(
+                    "UPDATE daily_commitments SET title=?1, done_definition=?2,
+                            estimated_minutes=?3, priority=?4, rank=?5, steps=?6
+                     WHERE id=?7 AND plan_id=?8",
+                    params![
+                        item.commitment.title.trim(),
+                        item.commitment.done_definition.trim(),
+                        item.commitment.estimated_minutes,
+                        item.commitment.priority,
+                        rank,
+                        serde_json::to_string(&steps)?,
+                        id,
+                        plan.id
+                    ],
+                )?;
+            }
+            None => {
+                let steps = step_titles
+                    .iter()
+                    .map(|title| CommitmentStep {
+                        title: title.clone(),
+                        completed: false,
+                    })
+                    .collect::<Vec<_>>();
+                tx.execute(
+                    "INSERT INTO daily_commitments(plan_id, task_id, title, done_definition,
+                            estimated_minutes, priority, rank, status, created_at, steps)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9)",
+                    params![
+                        plan.id,
+                        item.commitment.task_id,
+                        item.commitment.title.trim(),
+                        item.commitment.done_definition.trim(),
+                        item.commitment.estimated_minutes,
+                        item.commitment.priority,
+                        rank,
+                        ts,
+                        serde_json::to_string(&steps)?
+                    ],
+                )?;
+                if let Some(task_id) = item.commitment.task_id {
+                    tx.execute(
+                        "UPDATE tasks SET status='committed'
+                         WHERE id=?1 AND status IN ('inbox','planned')",
+                        [task_id],
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok((
+        get_plan(tx, plan.id)?,
+        list_commitments(tx, plan.id)?,
+        impact,
+    ))
 }
 
 /// Mark today as off / vacation (spec §5).
@@ -474,5 +756,125 @@ mod tests {
             .collect();
         let tx = conn.transaction().unwrap();
         assert!(lock_day(&tx, &input(crate::db::today_local(), too_many)).is_err());
+    }
+
+    #[test]
+    fn revising_a_day_preserves_started_rows_and_checked_steps() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let date = crate::db::today_local();
+        let mut original = input(
+            date.clone(),
+            vec!["Review the draft".into(), "Publish the brief".into()],
+        );
+        original.commitments.push(CommitmentInput {
+            task_id: None,
+            title: "Clear the finance queue".into(),
+            done_definition: "Every approved finance request has a recorded decision.".into(),
+            estimated_minutes: Some(30),
+            priority: "should".into(),
+            steps: vec!["Open the finance queue".into()],
+        });
+        let (_, original_commitments) = {
+            let tx = conn.transaction().unwrap();
+            let result = lock_day(&tx, &original).unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        let kept_id = original_commitments[0].id;
+        let removed_id = original_commitments[1].id;
+        set_commitment_step_completed(&conn, kept_id, 0, true).unwrap();
+        set_commitment_status(&conn, kept_id, "active", None, None).unwrap();
+
+        let revision = ReviseDayInput {
+            date,
+            commitments: vec![
+                ReviseCommitmentInput {
+                    id: Some(kept_id),
+                    commitment: CommitmentInput {
+                        task_id: None,
+                        title: "Publish the revised launch brief".into(),
+                        done_definition: "The revised launch brief is approved and published.".into(),
+                        estimated_minutes: Some(75),
+                        priority: "must".into(),
+                        steps: vec!["  Review   the draft ".into(), "Send approval note".into()],
+                    },
+                },
+                ReviseCommitmentInput {
+                    id: None,
+                    commitment: CommitmentInput {
+                        task_id: None,
+                        title: "Send the customer recap".into(),
+                        done_definition: "The customer receives a concise written recap today.".into(),
+                        estimated_minutes: Some(20),
+                        priority: "should".into(),
+                        steps: vec![],
+                    },
+                },
+            ],
+            likely_distraction: "Email".into(),
+            countermeasure: "Capture requests and return to the brief.".into(),
+            most_important_when: "now".into(),
+            interview_answers: serde_json::json!({"revised": true}),
+        };
+
+        let (_, revised, impact) = {
+            let tx = conn.transaction().unwrap();
+            let result = revise_day(&tx, &revision).unwrap();
+            tx.commit().unwrap();
+            result
+        };
+
+        assert_eq!(revised.len(), 2);
+        assert_eq!(revised[0].id, kept_id);
+        assert_eq!(revised[0].status, "active");
+        assert!(revised[0].started_at.is_some());
+        assert_eq!(revised[0].title, "Publish the revised launch brief");
+        assert_eq!(revised[0].steps[0].title, "Review   the draft");
+        assert!(revised[0].steps[0].completed);
+        assert!(!revised[0].steps[1].completed);
+        assert!(matches!(
+            get_commitment(&conn, removed_id),
+            Err(AppError::NotFound(_))
+        ));
+        assert_ne!(revised[1].id, kept_id);
+        assert_eq!(revised[1].status, "pending");
+        assert_eq!(impact.semantic_commitment_ids, vec![kept_id]);
+    }
+
+    #[test]
+    fn revising_a_day_cannot_remove_started_commitments() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let date = crate::db::today_local();
+        let (_, commitments) = {
+            let tx = conn.transaction().unwrap();
+            let result = lock_day(&tx, &input(date.clone(), vec![])).unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        set_commitment_status(&conn, commitments[0].id, "active", None, None).unwrap();
+
+        let revision = ReviseDayInput {
+            date,
+            commitments: vec![ReviseCommitmentInput {
+                id: None,
+                commitment: CommitmentInput {
+                    task_id: None,
+                    title: "Use a replacement outcome".into(),
+                    done_definition: "The replacement outcome is fully complete today.".into(),
+                    estimated_minutes: Some(30),
+                    priority: "must".into(),
+                    steps: vec![],
+                },
+            }],
+            likely_distraction: "Email".into(),
+            countermeasure: "Capture it and return to the outcome.".into(),
+            most_important_when: "flexible".into(),
+            interview_answers: serde_json::Value::Null,
+        };
+        let tx = conn.transaction().unwrap();
+        let error = revise_day(&tx, &revision).unwrap_err().to_string();
+        assert!(error.contains("must stay in today's record"), "{error}");
     }
 }

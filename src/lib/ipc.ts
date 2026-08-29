@@ -204,6 +204,17 @@ export interface CommitmentProgress {
   focused_secs: number;
 }
 
+export interface WorkHoursSummary {
+  start_min: number;
+  end_min: number;
+  in_work_hours: boolean;
+  elapsed_secs: number;
+  tracked_secs: number;
+  gap_secs: number;
+  productivity: number | null;
+  totals: DayTotals;
+}
+
 export interface TodaySnapshot {
   date: string;
   plan: DailyPlan | null;
@@ -221,6 +232,7 @@ export interface TodaySnapshot {
   warned: boolean;
   commitment_progress: CommitmentProgress[];
   extension_connected: boolean;
+  work_hours: WorkHoursSummary;
 }
 
 export interface Settings {
@@ -400,6 +412,19 @@ export interface LockDayInput {
   interview_answers?: unknown;
 }
 
+export interface ReviseCommitmentInput extends CommitmentInput {
+  id: number | null;
+}
+
+export interface ReviseDayInput {
+  date: string;
+  commitments: ReviseCommitmentInput[];
+  likely_distraction?: string;
+  countermeasure?: string;
+  most_important_when?: string;
+  interview_answers?: unknown;
+}
+
 export interface TodayPlan {
   plan: DailyPlan | null;
   commitments: Commitment[];
@@ -453,6 +478,7 @@ export const api = {
   getTodayPlan: () => invoke<TodayPlan>("get_today_plan"),
   getPlanForDate: (date: string) => invoke<TodayPlan>("get_plan_for_date", { date }),
   lockDay: (input: LockDayInput) => invoke<TodayPlan>("lock_day", { input }),
+  reviseDay: (input: ReviseDayInput) => invoke<TodayPlan>("revise_day", { input }),
   markDayOff: (date?: string) => invoke<DailyPlan>("mark_day_off", { date: date ?? null }),
   snoozeInterview: (minutes?: number) =>
     invoke<{ allowed: boolean; message: string | null; snoozed_until: number | null }>(

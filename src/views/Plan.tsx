@@ -15,11 +15,15 @@ export default function Plan() {
     <div className="mx-auto max-w-3xl space-y-4 p-6">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold text-ink-50">Daily Plan</h1>
-        {!locked && (
+        {!locked ? (
           <button className="btn btn-primary" onClick={() => setModal({ kind: "interview" })}>
             Start morning interview
           </button>
-        )}
+        ) : plan?.ended_at == null ? (
+          <button className="btn" onClick={() => setModal({ kind: "interview", mode: "edit" })}>
+            Edit today's plan
+          </button>
+        ) : null}
       </div>
 
       {plan?.is_day_off ? (
@@ -38,8 +42,14 @@ export default function Plan() {
         <>
           <div className="card">
             <div className="mb-3 flex items-center justify-between">
-              <p className="section-title">Today's contract</p>
-              <p className="text-2xs text-ink-500">locked {fmtTime(plan!.locked_at!)}</p>
+              <div>
+                <p className="section-title">Today's contract</p>
+                <p className="mt-1 text-2xs text-ink-500">
+                  Locked protects your accountability record. Use Edit today's plan to revise it
+                  without losing focus history or checked steps.
+                </p>
+              </div>
+              <p className="shrink-0 text-2xs text-ink-500">locked {fmtTime(plan!.locked_at!)}</p>
             </div>
             <ol className="space-y-2">
               {commitments.map((c) => (

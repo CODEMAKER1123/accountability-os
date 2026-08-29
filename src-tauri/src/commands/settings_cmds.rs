@@ -643,7 +643,7 @@ pub fn set_widget_visible(app: tauri::AppHandle, state: State<'_, AppState>, vis
         tauri::WebviewUrl::App("index.html".into()),
     )
     .title("Focus")
-    .inner_size(280.0, 200.0)
+    .inner_size(340.0, 430.0)
     .resizable(false)
     .decorations(false)
     .always_on_top(always_on_top)

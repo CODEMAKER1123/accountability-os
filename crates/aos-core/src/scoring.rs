@@ -49,6 +49,21 @@ pub fn commitment_alignment(t: &DayTotals) -> Option<f64> {
     Some((num / denom * 100.0).clamp(0.0, 100.0))
 }
 
+/// Share of monitored work-hours time that was productively used. Unlike
+/// commitment alignment, this intentionally includes idle time in the
+/// denominator so gaps in the configured workday remain visible. Unknown
+/// time is excluded until it has a trustworthy classification.
+pub fn work_hours_productivity(t: &DayTotals) -> Option<f64> {
+    let denom = (t.non_idle_secs() + t.idle_secs) as f64;
+    if denom <= 0.0 {
+        return None;
+    }
+    let productive = t.focused_secs as f64
+        + t.supporting_secs as f64 * 0.7
+        + t.neutral_secs as f64 * 0.25;
+    Some((productive / denom * 100.0).clamp(0.0, 100.0))
+}
+
 /// Focus Score (spec §19): quality of attention while working. Uses the §10
 /// weights (neutral counts a little — necessary admin isn't distraction),
 /// minus a context-switching penalty above 6 switches/hour.
@@ -228,6 +243,21 @@ mod tests {
     fn perfect_day_scores_100_alignment() {
         let a = commitment_alignment(&totals(120, 0, 0, 0, 0)).unwrap();
         assert!((a - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn work_hours_productivity_surfaces_idle_gaps() {
+        let productive = totals(60, 30, 10, 20, 60);
+        // (60 + 21 + 2.5) / (60 + 30 + 10 + 20 + 60) = 46.388...%
+        let score = work_hours_productivity(&productive).unwrap();
+        assert!((score - 46.38888).abs() < 0.001, "got {score}");
+
+        let idle_only = totals(0, 0, 0, 0, 60);
+        assert_eq!(work_hours_productivity(&idle_only), Some(0.0));
+
+        let mut unknown_only = DayTotals::default();
+        unknown_only.unknown_secs = 3600;
+        assert_eq!(work_hours_productivity(&unknown_only), None);
     }
 
     #[test]

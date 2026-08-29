@@ -13,6 +13,7 @@ function q1(title: string, index: number): InterviewCandidate {
     key: `q1-${index}`,
     source: "q1",
     title,
+    commitment_id: null,
     task_id: null,
     selected: index < 3,
     priority: "must",
@@ -44,12 +45,14 @@ describe("question-one candidate reconciliation", () => {
   });
 
   it("preserves metadata for an edited goal in the same slot", () => {
+    const existing = { ...q1("Finish sales playbook", 0), commitment_id: 42 };
     const edited = reconcileQuestionOneCandidates(
-      [q1("Finish sales playbook", 0)],
+      [existing],
       "Finish and send sales playbook",
     );
 
     expect(edited[0]).toMatchObject({
+      commitment_id: 42,
       done_definition: "A clear completion definition.",
       steps: ["Open the draft", "Send the result"],
       selected: true,
