@@ -351,6 +351,9 @@ function CommitmentRow({
   const isTerminal = ["completed", "deferred", "dropped", "cancelled"].includes(
     commitment.status,
   );
+  const planOpen = snapshot?.plan?.ended_at == null;
+  const canEditSteps = !isTerminal && planOpen;
+  const canShowSteps = commitment.steps.length > 0;
   const requiresSwitch = contractId != null && !isPausedContract;
   const focused =
     snapshot?.commitment_progress.find((p) => p.commitment_id === commitment.id)?.focused_secs ?? 0;
@@ -375,7 +378,7 @@ function CommitmentRow({
               ` · ${commitment.steps.filter((step) => step.completed).length}/${commitment.steps.length} steps`}
           </p>
         </div>
-        {!isTerminal && (
+        {(canEditSteps || canShowSteps) && (
           <button
             className="btn btn-ghost shrink-0 px-2 py-1 text-accent"
             aria-expanded={showSteps}
@@ -435,7 +438,8 @@ function CommitmentRow({
       {showSteps && (
         <CommitmentSteps
           commitment={commitment}
-          initiallyBreakingDown={commitment.steps.length === 0}
+          initiallyBreakingDown={canEditSteps && commitment.steps.length === 0}
+          allowBreakdown={canEditSteps}
         />
       )}
     </div>

@@ -27,6 +27,7 @@ const STATUS_FILTERS: { id: TaskStatus | "open"; label: string }[] = [
 
 export default function Tasks() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [allOpenTasks, setAllOpenTasks] = useState<Task[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [filter, setFilter] = useState<TaskStatus | "open">("open");
   const [search, setSearch] = useState("");
@@ -37,8 +38,11 @@ export default function Tasks() {
   const reload = useCallback(async () => {
     try {
       const status = filter === "open" ? null : filter;
-      const [t, p] = await Promise.all([api.listTasks(status, search || null), api.listProjects()]);
+      const visibleTasks = api.listTasks(status, search || null);
+      const taskContext = status == null && !search ? visibleTasks : api.listTasks(null, null);
+      const [t, p, all] = await Promise.all([visibleTasks, api.listProjects(), taskContext]);
       setTasks(t);
+      setAllOpenTasks(all);
       setProjects(p);
       setError(null);
     } catch (e) {
@@ -51,6 +55,12 @@ export default function Tasks() {
   }, [reload]);
 
   const taskRows = flattenTaskHierarchy(tasks);
+  const allChildrenByParent = new Map(
+    flattenTaskHierarchy(allOpenTasks).map(({ task, directChildren }) => [
+      task.id,
+      directChildren,
+    ]),
+  );
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
@@ -107,7 +117,7 @@ export default function Tasks() {
               key={task.id}
               task={task}
               depth={depth}
-              childTasks={directChildren}
+              childTasks={allChildrenByParent.get(task.id) ?? directChildren}
               projects={projects}
               onChanged={reload}
               editing={editing?.id === task.id}

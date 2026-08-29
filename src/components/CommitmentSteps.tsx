@@ -7,19 +7,21 @@ import { useStore } from "@/lib/store";
 export function CommitmentSteps({
   commitment,
   initiallyBreakingDown = false,
+  allowBreakdown = true,
 }: {
   commitment: Commitment;
   initiallyBreakingDown?: boolean;
+  allowBreakdown?: boolean;
 }) {
   const { refreshSnapshot } = useStore();
   const [busyIndex, setBusyIndex] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [breakingDown, setBreakingDown] = useState(initiallyBreakingDown);
-  const terminal = ["completed", "deferred", "dropped", "cancelled"].includes(
-    commitment.status,
-  );
+  const terminal =
+    !allowBreakdown ||
+    ["completed", "deferred", "dropped", "cancelled"].includes(commitment.status);
 
-  const editor = breakingDown ? (
+  const editor = breakingDown && !terminal ? (
     <BreakdownEditor
       goal={commitment.title}
       existingSteps={commitment.steps.map((step) => step.title)}
