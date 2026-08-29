@@ -62,6 +62,10 @@ $resolvedKeyPath = [IO.Path]::GetFullPath($KeyPath)
 if (-not [IO.File]::Exists($resolvedKeyPath)) {
   throw "Updater signing key was not found: $resolvedKeyPath"
 }
+$releaseConfigPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\src-tauri\tauri.release.conf.json"))
+if (-not [IO.File]::Exists($releaseConfigPath)) {
+  throw "Updater release configuration was not found: $releaseConfigPath"
+}
 
 $previousKey = [Environment]::GetEnvironmentVariable("TAURI_SIGNING_PRIVATE_KEY", "Process")
 $previousPassword = [Environment]::GetEnvironmentVariable("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", "Process")
@@ -77,7 +81,7 @@ try {
   }
 
   Write-Host "Building signed Windows installer and updater artifacts..."
-  & npm.cmd run tauri build
+  & npm.cmd run tauri -- build --config $releaseConfigPath
   if ($LASTEXITCODE -ne 0) {
     throw "The signed Tauri build failed with exit code $LASTEXITCODE."
   }

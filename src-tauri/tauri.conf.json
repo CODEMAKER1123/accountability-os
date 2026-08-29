@@ -28,7 +28,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": ["nsis"],
     "category": "Productivity",
     "shortDescription": "AI desktop productivity & focus coach",

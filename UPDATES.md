@@ -24,6 +24,8 @@ npm run build:signed
 
 The helper reads the encrypted private key and its password only into the build process, then clears both environment variables. It does not print either secret. Other contributors should use the GitHub release workflow rather than sharing the signing key.
 
+Plain `npx tauri build` remains an unsigned contributor build and does not require the updater signing key. The signed helper and protected release workflow explicitly merge `src-tauri/tauri.release.conf.json` to enable updater artifacts.
+
 ## Signing-key custody
 
 - Protected GitHub Actions `release` environment secrets: `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
