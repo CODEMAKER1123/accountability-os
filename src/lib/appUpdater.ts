@@ -44,7 +44,7 @@ export function reduceDownloadProgress(
 }
 
 export async function checkForAppUpdate(force = false): Promise<Update | null> {
-  if (readyUpdate) return readyUpdate;
+  if (!force && readyUpdate) return readyUpdate;
   if (pendingCheck) return pendingCheck;
   if (!force && Date.now() - lastCheckedAt < MIN_CHECK_INTERVAL_MS) return null;
 
@@ -60,6 +60,13 @@ export async function checkForAppUpdate(force = false): Promise<Update | null> {
       pendingCheck = null;
     });
   return pendingCheck;
+}
+
+export function invalidateAppUpdate(update: Update): void {
+  if (readyUpdate === update) {
+    readyUpdate = null;
+    lastCheckedAt = 0;
+  }
 }
 
 export async function downloadAndInstallAppUpdate(

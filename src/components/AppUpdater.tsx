@@ -5,10 +5,11 @@ import {
   checkForAppUpdate,
   downloadAndInstallAppUpdate,
   EMPTY_UPDATE_PROGRESS,
+  invalidateAppUpdate,
   type UpdateDownloadProgress,
 } from "@/lib/appUpdater";
 
-type InstallPhase = "ready" | "downloading" | "installing" | "restarting" | "failed";
+type InstallPhase = "ready" | "checking" | "downloading" | "installing" | "restarting" | "failed";
 
 const STARTUP_CHECK_DELAY_MS = 2_000;
 const BACKGROUND_CHECK_INTERVAL_MS = 4 * 60 * 60_000;
@@ -25,7 +26,11 @@ export default function AppUpdater() {
     const checkNow = async () => {
       try {
         const available = await checkForAppUpdate();
-        if (mounted.current && available) setUpdate(available);
+        if (mounted.current && available) {
+          setUpdate(available);
+          setFailure(null);
+          setPhase((current) => (current === "failed" ? "ready" : current));
+        }
       } catch (error) {
         // Startup checks stay quiet while offline. The next background check
         // retries without interrupting the user's work.
@@ -47,11 +52,25 @@ export default function AppUpdater() {
 
   const install = async () => {
     if (phase !== "ready" && phase !== "failed") return;
+    let candidate = update;
     setFailure(null);
     setProgress(EMPTY_UPDATE_PROGRESS);
-    setPhase("downloading");
     try {
-      await downloadAndInstallAppUpdate(update, (nextProgress) => {
+      if (phase === "failed") {
+        setPhase("checking");
+        const refreshed = await checkForAppUpdate(true);
+        if (!mounted.current) return;
+        if (!refreshed) {
+          setUpdate(null);
+          setPhase("ready");
+          return;
+        }
+        candidate = refreshed;
+        setUpdate(refreshed);
+      }
+
+      setPhase("downloading");
+      await downloadAndInstallAppUpdate(candidate, (nextProgress) => {
         if (!mounted.current) return;
         setProgress(nextProgress);
         if (nextProgress.finished) setPhase("installing");
@@ -61,15 +80,22 @@ export default function AppUpdater() {
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (error) {
+      invalidateAppUpdate(candidate);
       if (!mounted.current) return;
       setFailure(error instanceof Error ? error.message : String(error));
       setPhase("failed");
     }
   };
 
-  const busy = phase === "downloading" || phase === "installing" || phase === "restarting";
+  const busy =
+    phase === "checking" ||
+    phase === "downloading" ||
+    phase === "installing" ||
+    phase === "restarting";
   const label =
-    phase === "downloading"
+    phase === "checking"
+      ? "Checking for update"
+      : phase === "downloading"
       ? progress.percent == null
         ? "Downloading update"
         : `Downloading ${progress.percent}%`
