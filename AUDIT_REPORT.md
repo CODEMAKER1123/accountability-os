@@ -53,7 +53,7 @@ RustSec's warnings comprise 16 unmaintained transitive packages plus one `glib` 
 ## Build artifacts
 
 - Native executable: `target/release/accountability-os.exe`
-- Windows installer: `target/release/bundle/nsis/Accountability OS_0.1.0_x64-setup.exe`
+- Windows installer: `target/release/bundle/nsis/Accountability OS_<version>_x64-setup.exe`
 - Per-user database created by the smoke test: `%APPDATA%/com.accountability-os.desktop/accountability.sqlite3`
 
 ## Remaining release considerations

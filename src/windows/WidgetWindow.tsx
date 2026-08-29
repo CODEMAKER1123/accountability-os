@@ -1,24 +1,33 @@
 // Always-on-top mini focus widget (spec §25).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { api, type TodaySnapshot } from "@/lib/ipc";
+import { api, errorMessage, type TodaySnapshot } from "@/lib/ipc";
 import { fmtClockDuration, fmtDuration, fmtPct } from "@/lib/time";
 
 export default function WidgetWindow() {
   const [snap, setSnap] = useState<TodaySnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [, force] = useState(0);
 
+  const load = useCallback(async () => {
+    try {
+      setSnap(await api.getTodaySnapshot());
+      setError(null);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    }
+  }, []);
+
   useEffect(() => {
-    const load = () => void api.getTodaySnapshot().then(setSnap).catch(() => undefined);
-    load();
-    const poll = setInterval(load, 5000);
+    void load();
+    const poll = setInterval(() => void load(), 5000);
     const tick = setInterval(() => force((n) => n + 1), 1000);
     return () => {
       clearInterval(poll);
       clearInterval(tick);
     };
-  }, []);
+  }, [load]);
 
   const now = Math.floor(Date.now() / 1000);
   const active = snap?.active_commitment ?? null;
@@ -42,13 +51,35 @@ export default function WidgetWindow() {
         <button
           className="text-ink-600 hover:text-ink-300"
           title="Close widget"
-          onClick={() => void api.setWidgetVisible(false)}
+          onClick={async () => {
+            try {
+              await api.setWidgetVisible(false);
+            } catch (caught) {
+              setError(errorMessage(caught));
+            }
+          }}
         >
           ✕
         </button>
       </div>
 
-      {onBreak && snap?.current_break ? (
+      {error && snap && (
+        <p className="mt-1 line-clamp-2 text-2xs text-distracted" role="alert">
+          {error}
+        </p>
+      )}
+
+      {error && !snap ? (
+        <div className="mt-2 flex flex-1 flex-col">
+          <p className="text-xs font-medium text-distracted">Widget could not load</p>
+          <p className="mt-1 line-clamp-3 text-2xs text-ink-400">{error}</p>
+          <button className="btn mt-auto py-1 text-2xs" onClick={() => void load()}>
+            Retry
+          </button>
+        </div>
+      ) : !snap ? (
+        <div className="mt-2 flex flex-1 items-center text-xs text-ink-400">Loading…</div>
+      ) : onBreak && snap.current_break ? (
         <div className="mt-1 flex flex-1 flex-col" data-tauri-drag-region>
           <p className="font-mono text-2xl text-ink-50">
             {fmtClockDuration(snap.current_break.ends_at - now)}
@@ -77,7 +108,12 @@ export default function WidgetWindow() {
             <button
               className="btn flex-1 py-1 text-2xs"
               onClick={async () => {
-                await api.completeCommitment(active.id);
+                try {
+                  await api.completeCommitment(active.id);
+                  await load();
+                } catch (caught) {
+                  setError(errorMessage(caught));
+                }
               }}
             >
               Done
@@ -85,7 +121,12 @@ export default function WidgetWindow() {
             <button
               className="btn flex-1 py-1 text-2xs"
               onClick={async () => {
-                await api.pauseFocus();
+                try {
+                  await api.pauseFocus();
+                  await load();
+                } catch (caught) {
+                  setError(errorMessage(caught));
+                }
               }}
             >
               Pause
@@ -94,8 +135,17 @@ export default function WidgetWindow() {
         </div>
       ) : (
         <div className="mt-1 flex flex-1 flex-col" data-tauri-drag-region>
-          <p className="text-xs text-ink-400">Nothing active.</p>
-          <button className="btn mt-auto py-1 text-2xs" onClick={() => void api.showMainWindow()}>
+          <p className="text-xs text-ink-400">No active commitment.</p>
+          <button
+            className="btn mt-auto py-1 text-2xs"
+            onClick={async () => {
+              try {
+                await api.showMainWindow();
+              } catch (caught) {
+                setError(errorMessage(caught));
+              }
+            }}
+          >
             Open app
           </button>
         </div>

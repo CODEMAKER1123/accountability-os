@@ -1,12 +1,13 @@
 import { useEffect } from "react";
 
 import BlockedModal from "@/components/BlockedModal";
+import AppUpdater from "@/components/AppUpdater";
 import BreakModal from "@/components/BreakModal";
 import Interview from "@/components/Interview";
 import Onboarding from "@/components/Onboarding";
 import ReviewModal from "@/components/ReviewModal";
 import SwitchModal from "@/components/SwitchModal";
-import { MonitoringBadge } from "@/components/shared";
+import { ErrorBanner, MonitoringBadge } from "@/components/shared";
 import { onAppEvent } from "@/lib/events";
 import { useStore, type View } from "@/lib/store";
 import Activity from "@/views/Activity";
@@ -26,8 +27,17 @@ const NAV: { id: View; label: string }[] = [
 ];
 
 export default function App() {
-  const { view, setView, modal, setModal, snapshot, refreshSnapshot, settings, loadSettings } =
-    useStore();
+  const {
+    view,
+    setView,
+    modal,
+    setModal,
+    snapshot,
+    snapshotError,
+    refreshSnapshot,
+    settings,
+    loadSettings,
+  } = useStore();
 
   useEffect(() => {
     void refreshSnapshot();
@@ -106,6 +116,7 @@ export default function App() {
           ))}
         </nav>
         <div className="mt-auto space-y-2 border-t border-ink-700 p-3">
+          <AppUpdater />
           {snapshot && (
             <MonitoringBadge
               state={snapshot.monitoring_state}
@@ -120,6 +131,14 @@ export default function App() {
 
       {/* Main */}
       <main className="min-w-0 flex-1 overflow-y-auto">
+        {snapshotError && (
+          <div className="mx-auto max-w-5xl px-6 pt-4">
+            <ErrorBanner
+              message={`Accountability OS could not refresh its local data: ${snapshotError}`}
+              onRetry={() => void refreshSnapshot()}
+            />
+          </div>
+        )}
         {view === "today" && <Today />}
         {view === "tasks" && <Tasks />}
         {view === "plan" && <Plan />}

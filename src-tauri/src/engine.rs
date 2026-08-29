@@ -43,7 +43,7 @@ pub fn open_popup(app: &tauri::AppHandle) {
     let result = tauri::WebviewWindowBuilder::new(
         app,
         "intervention",
-        tauri::WebviewUrl::App("index.html?window=popup".into()),
+        tauri::WebviewUrl::App("index.html".into()),
     )
     .title("Accountability OS")
     .inner_size(520.0, 560.0)

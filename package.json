@@ -1,7 +1,7 @@
 {
   "name": "accountability-os",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "AI desktop productivity & focus coach. Plan, commit, monitor, interrupt, score, review, improve.",
   "scripts": {
@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "build:signed": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-signed.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -19,6 +20,8 @@
     "@tauri-apps/plugin-dialog": "^2.2.0",
     "@tauri-apps/plugin-global-shortcut": "^2.2.0",
     "@tauri-apps/plugin-notification": "^2.2.0",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "zustand": "^5.0.3"
