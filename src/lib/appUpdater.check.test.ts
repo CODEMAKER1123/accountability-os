@@ -52,8 +52,8 @@ describe("app update checks", () => {
   });
 
   it("refreshes cached metadata when a check is forced", async () => {
-    const firstUpdate = { version: "0.2.0" } as never;
-    const secondUpdate = { version: "0.2.1" } as never;
+    const firstUpdate = { version: "0.2.0", close: vi.fn().mockResolvedValue(undefined) };
+    const secondUpdate = { version: "0.2.1", close: vi.fn().mockResolvedValue(undefined) };
     updaterMocks.check.mockResolvedValueOnce(firstUpdate).mockResolvedValueOnce(secondUpdate);
     const { checkForAppUpdate } = await import("./appUpdater");
 
@@ -63,11 +63,12 @@ describe("app update checks", () => {
 
     await expect(checkForAppUpdate(true)).resolves.toBe(secondUpdate);
     expect(updaterMocks.check).toHaveBeenCalledTimes(2);
+    expect(firstUpdate.close).toHaveBeenCalledOnce();
   });
 
   it("refreshes cached metadata after the check interval expires", async () => {
-    const firstUpdate = { version: "0.2.0" } as never;
-    const replacementUpdate = { version: "0.2.1" } as never;
+    const firstUpdate = { version: "0.2.0", close: vi.fn().mockResolvedValue(undefined) };
+    const replacementUpdate = { version: "0.2.1", close: vi.fn().mockResolvedValue(undefined) };
     updaterMocks.check.mockResolvedValueOnce(firstUpdate).mockResolvedValueOnce(replacementUpdate);
     const { checkForAppUpdate } = await import("./appUpdater");
 
@@ -75,17 +76,31 @@ describe("app update checks", () => {
     vi.advanceTimersByTime(5 * 60_000);
     await expect(checkForAppUpdate()).resolves.toBe(replacementUpdate);
     expect(updaterMocks.check).toHaveBeenCalledTimes(2);
+    expect(firstUpdate.close).toHaveBeenCalledOnce();
   });
 
   it("invalidates a failed download so the next check gets fresh metadata", async () => {
-    const failedUpdate = { version: "0.2.0" } as never;
-    const replacementUpdate = { version: "0.2.1" } as never;
+    const failedUpdate = { version: "0.2.0", close: vi.fn().mockResolvedValue(undefined) };
+    const replacementUpdate = { version: "0.2.1", close: vi.fn().mockResolvedValue(undefined) };
     updaterMocks.check.mockResolvedValueOnce(failedUpdate).mockResolvedValueOnce(replacementUpdate);
     const { checkForAppUpdate, invalidateAppUpdate } = await import("./appUpdater");
 
     await expect(checkForAppUpdate()).resolves.toBe(failedUpdate);
-    invalidateAppUpdate(failedUpdate);
+    await invalidateAppUpdate(failedUpdate as never);
     await expect(checkForAppUpdate()).resolves.toBe(replacementUpdate);
     expect(updaterMocks.check).toHaveBeenCalledTimes(2);
+    expect(failedUpdate.close).toHaveBeenCalledOnce();
+  });
+
+  it("closes an update handle after a failed download", async () => {
+    const failure = new Error("download failed");
+    const update = {
+      downloadAndInstall: vi.fn().mockRejectedValue(failure),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const { downloadAndInstallAppUpdate } = await import("./appUpdater");
+
+    await expect(downloadAndInstallAppUpdate(update as never, vi.fn())).rejects.toBe(failure);
+    expect(update.close).toHaveBeenCalledOnce();
   });
 });

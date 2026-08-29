@@ -84,7 +84,7 @@ export default function AppUpdater() {
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (error) {
-      invalidateAppUpdate(candidate);
+      await invalidateAppUpdate(candidate);
       if (!mounted.current) return;
       setFailure(error instanceof Error ? error.message : String(error));
       setPhase("failed");

@@ -8,6 +8,14 @@ let readyUpdate: Update | null = null;
 let pendingCheck: Promise<Update | null> | null = null;
 let lastCheckedAt = 0;
 
+async function closeAppUpdate(update: Update): Promise<void> {
+  try {
+    await update.close();
+  } catch (error) {
+    console.warn("failed to close update handle", error);
+  }
+}
+
 export interface UpdateDownloadProgress {
   downloaded: number;
   total: number | null;
@@ -51,8 +59,10 @@ export async function checkForAppUpdate(force = false): Promise<Update | null> {
   // could hammer the update endpoint while the network is unavailable.
   lastCheckedAt = Date.now();
   pendingCheck = check({ timeout: CHECK_TIMEOUT_MS })
-    .then((update) => {
+    .then(async (update) => {
+      const previous = readyUpdate;
       readyUpdate = update;
+      if (previous && previous !== update) await closeAppUpdate(previous);
       return update;
     })
     .finally(() => {
@@ -61,10 +71,11 @@ export async function checkForAppUpdate(force = false): Promise<Update | null> {
   return pendingCheck;
 }
 
-export function invalidateAppUpdate(update: Update): void {
+export async function invalidateAppUpdate(update: Update): Promise<void> {
+  lastCheckedAt = 0;
   if (readyUpdate === update) {
     readyUpdate = null;
-    lastCheckedAt = 0;
+    await closeAppUpdate(update);
   }
 }
 
@@ -72,12 +83,19 @@ export async function downloadAndInstallAppUpdate(
   update: Update,
   onProgress: (progress: UpdateDownloadProgress) => void,
 ): Promise<void> {
+  // Transfer ownership from the metadata cache to this install attempt. A
+  // concurrent refresh may replace the cache without closing this active handle.
+  if (readyUpdate === update) readyUpdate = null;
   let progress = EMPTY_UPDATE_PROGRESS;
-  await update.downloadAndInstall(
-    (event) => {
-      progress = reduceDownloadProgress(progress, event);
-      onProgress(progress);
-    },
-    { timeout: DOWNLOAD_TIMEOUT_MS },
-  );
+  try {
+    await update.downloadAndInstall(
+      (event) => {
+        progress = reduceDownloadProgress(progress, event);
+        onProgress(progress);
+      },
+      { timeout: DOWNLOAD_TIMEOUT_MS },
+    );
+  } finally {
+    await closeAppUpdate(update);
+  }
 }
