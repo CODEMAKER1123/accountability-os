@@ -19,11 +19,17 @@ export default function AppUpdater() {
   const [phase, setPhase] = useState<InstallPhase>("ready");
   const [progress, setProgress] = useState<UpdateDownloadProgress>(EMPTY_UPDATE_PROGRESS);
   const [failure, setFailure] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const mounted = useRef(true);
+  const refreshInProgress = useRef(false);
+  const installInProgress = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
     const checkNow = async () => {
+      if (refreshInProgress.current || installInProgress.current) return;
+      refreshInProgress.current = true;
+      setRefreshing(true);
       try {
         const available = await checkForAppUpdate();
         if (!mounted.current) return;
@@ -39,6 +45,9 @@ export default function AppUpdater() {
         // Startup checks stay quiet while offline. The next background check
         // retries without interrupting the user's work.
         console.warn("update check failed", error);
+      } finally {
+        refreshInProgress.current = false;
+        if (mounted.current) setRefreshing(false);
       }
     };
     const initial = window.setTimeout(() => void checkNow(), STARTUP_CHECK_DELAY_MS);
@@ -55,7 +64,14 @@ export default function AppUpdater() {
   if (!update) return null;
 
   const install = async () => {
-    if (phase !== "ready" && phase !== "failed") return;
+    if (
+      refreshInProgress.current ||
+      installInProgress.current ||
+      (phase !== "ready" && phase !== "failed")
+    ) {
+      return;
+    }
+    installInProgress.current = true;
     let candidate = update;
     setFailure(null);
     setProgress(EMPTY_UPDATE_PROGRESS);
@@ -88,16 +104,19 @@ export default function AppUpdater() {
       if (!mounted.current) return;
       setFailure(error instanceof Error ? error.message : String(error));
       setPhase("failed");
+    } finally {
+      installInProgress.current = false;
     }
   };
 
   const busy =
+    refreshing ||
     phase === "checking" ||
     phase === "downloading" ||
     phase === "installing" ||
     phase === "restarting";
   const label =
-    phase === "checking"
+    refreshing || phase === "checking"
       ? "Checking for update"
       : phase === "downloading"
       ? progress.percent == null
