@@ -99,6 +99,7 @@ pub fn run() {
             // tasks
             commands::list_tasks,
             commands::create_task,
+            commands::create_task_steps,
             commands::update_task,
             commands::set_task_status,
             commands::delete_task,
@@ -114,6 +115,7 @@ pub fn run() {
             commands::snooze_interview,
             commands::commitment_limit_check,
             commands::set_commitment_step_completed,
+            commands::add_commitment_steps,
             // focus / commitments
             commands::start_commitment,
             commands::pause_focus,

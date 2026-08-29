@@ -74,7 +74,10 @@ export default function Plan() {
                       status: {c.status}
                       {c.outcome_reason && ` · ${c.outcome_reason.replaceAll("_", " ")}`}
                     </p>
-                    <CommitmentSteps commitment={c} />
+                    <CommitmentSteps
+                      commitment={c}
+                      allowBreakdown={plan!.ended_at == null}
+                    />
                   </div>
                   <PriorityTag priority={c.priority} />
                 </li>

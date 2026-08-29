@@ -255,8 +255,10 @@ mod tests {
         let idle_only = totals(0, 0, 0, 0, 60);
         assert_eq!(work_hours_productivity(&idle_only), Some(0.0));
 
-        let mut unknown_only = DayTotals::default();
-        unknown_only.unknown_secs = 3600;
+        let unknown_only = DayTotals {
+            unknown_secs: 3600,
+            ..DayTotals::default()
+        };
         assert_eq!(work_hours_productivity(&unknown_only), None);
     }
 

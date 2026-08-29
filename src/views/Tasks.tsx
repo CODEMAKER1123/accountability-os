@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { BreakdownEditor } from "@/components/BreakdownEditor";
 import { EmptyState, ErrorBanner, PriorityTag } from "@/components/shared";
 import {
   api,
@@ -11,6 +12,7 @@ import {
   type Task,
   type TaskStatus,
 } from "@/lib/ipc";
+import { flattenTaskHierarchy } from "@/lib/taskBreakdown";
 
 const STATUS_FILTERS: { id: TaskStatus | "open"; label: string }[] = [
   { id: "open", label: "Open" },
@@ -25,6 +27,7 @@ const STATUS_FILTERS: { id: TaskStatus | "open"; label: string }[] = [
 
 export default function Tasks() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [allOpenTasks, setAllOpenTasks] = useState<Task[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [filter, setFilter] = useState<TaskStatus | "open">("open");
   const [search, setSearch] = useState("");
@@ -35,8 +38,11 @@ export default function Tasks() {
   const reload = useCallback(async () => {
     try {
       const status = filter === "open" ? null : filter;
-      const [t, p] = await Promise.all([api.listTasks(status, search || null), api.listProjects()]);
+      const visibleTasks = api.listTasks(status, search || null);
+      const taskContext = status == null && !search ? visibleTasks : api.listTasks(null, null);
+      const [t, p, all] = await Promise.all([visibleTasks, api.listProjects(), taskContext]);
       setTasks(t);
+      setAllOpenTasks(all);
       setProjects(p);
       setError(null);
     } catch (e) {
@@ -47,6 +53,14 @@ export default function Tasks() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  const taskRows = flattenTaskHierarchy(tasks);
+  const allChildrenByParent = new Map(
+    flattenTaskHierarchy(allOpenTasks).map(({ task, directChildren }) => [
+      task.id,
+      directChildren,
+    ]),
+  );
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
@@ -98,14 +112,16 @@ export default function Tasks() {
         />
       ) : (
         <div className="divide-y divide-ink-800 rounded-lg border border-ink-700 bg-ink-900">
-          {tasks.map((t) => (
+          {taskRows.map(({ task, depth, directChildren }) => (
             <TaskRow
-              key={t.id}
-              task={t}
+              key={task.id}
+              task={task}
+              depth={depth}
+              childTasks={allChildrenByParent.get(task.id) ?? directChildren}
               projects={projects}
               onChanged={reload}
-              editing={editing?.id === t.id}
-              setEditing={(open) => setEditing(open ? t : null)}
+              editing={editing?.id === task.id}
+              setEditing={(open) => setEditing(open ? task : null)}
               onError={setError}
             />
           ))}
@@ -276,6 +292,8 @@ function QuickAdd({
 
 function TaskRow({
   task,
+  depth,
+  childTasks,
   projects,
   onChanged,
   editing,
@@ -283,17 +301,27 @@ function TaskRow({
   onError,
 }: {
   task: Task;
+  depth: number;
+  childTasks: Task[];
   projects: Project[];
   onChanged: () => Promise<void>;
   editing: boolean;
   setEditing: (open: boolean) => void;
   onError: (message: string | null) => void;
 }) {
+  const [breakingDown, setBreakingDown] = useState(false);
   const project = projects.find((p) => p.id === task.project_id);
   const done = task.status === "completed";
+  const terminal = done || task.status === "cancelled";
+  const completedSteps = childTasks.filter((child) => child.status === "completed").length;
   return (
-    <div className="px-3 py-2">
+    <div className="px-3 py-2" style={{ paddingLeft: `${12 + Math.min(depth, 5) * 24}px` }}>
       <div className="flex items-center gap-3">
+        {depth > 0 && (
+          <span className="-ml-1 text-xs text-ink-600" aria-hidden="true">
+            ↳
+          </span>
+        )}
         <input
           type="checkbox"
           className="h-3.5 w-3.5 accent-[#4ea87c]"
@@ -320,8 +348,21 @@ function TaskRow({
             {task.due_date && ` · due ${task.due_date}`}
             {task.estimated_minutes != null && ` · ~${task.estimated_minutes}m`}
             {task.tags.length > 0 && ` · ${task.tags.join(", ")}`}
+            {childTasks.length > 0 && ` · ${completedSteps}/${childTasks.length} steps`}
           </span>
         </button>
+        {!terminal && (
+          <button
+            className="btn btn-ghost shrink-0 px-2 py-1 text-accent"
+            aria-expanded={breakingDown}
+            onClick={() => {
+              setEditing(false);
+              setBreakingDown((open) => !open);
+            }}
+          >
+            {breakingDown ? "Close steps" : "Break into steps"}
+          </button>
+        )}
         <PriorityTag priority={task.priority} />
         <button
           className="btn-ghost btn px-2 py-1 text-ink-500 hover:text-distracted"
@@ -346,6 +387,18 @@ function TaskRow({
           onSaved={async () => {
             setEditing(false);
             await onChanged();
+          }}
+        />
+      )}
+      {breakingDown && (
+        <BreakdownEditor
+          goal={task.title}
+          existingSteps={childTasks.map((child) => child.title)}
+          onClose={() => setBreakingDown(false)}
+          onSave={async (steps) => {
+            await api.createTaskSteps(task.id, steps);
+            await onChanged();
+            setBreakingDown(false);
           }}
         />
       )}
@@ -458,6 +511,7 @@ function TaskEditor({
               await api.updateTask(task.id, {
                 title: form.title,
                 description: form.description,
+                parent_task_id: task.parent_task_id,
                 priority: form.priority,
                 status: form.status,
                 project_id: form.project_id,

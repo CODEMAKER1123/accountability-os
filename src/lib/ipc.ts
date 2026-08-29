@@ -465,6 +465,8 @@ export const api = {
   listTasks: (status?: TaskStatus | null, search?: string | null) =>
     invoke<Task[]>("list_tasks", { status: status ?? null, search: search ?? null }),
   createTask: (input: TaskInput) => invoke<Task>("create_task", { input }),
+  createTaskSteps: (id: number, steps: string[]) =>
+    invoke<Task[]>("create_task_steps", { id, steps }),
   updateTask: (id: number, input: TaskInput) => invoke<Task>("update_task", { id, input }),
   setTaskStatus: (id: number, status: TaskStatus) =>
     invoke<Task>("set_task_status", { id, status }),
@@ -493,6 +495,8 @@ export const api = {
       stepIndex,
       completed,
     }),
+  addCommitmentSteps: (commitmentId: number, steps: string[]) =>
+    invoke<Commitment>("add_commitment_steps", { commitmentId, steps }),
 
   // focus
   startCommitment: (commitmentId: number) =>

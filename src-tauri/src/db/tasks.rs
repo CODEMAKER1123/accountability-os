@@ -27,6 +27,7 @@ const VALID_STATUSES: &[&str] = &[
     "inbox", "planned", "committed", "active", "completed", "deferred", "cancelled",
 ];
 const VALID_PRIORITIES: &[&str] = &["must", "should", "could"];
+const MAX_TASK_STEPS: usize = 12;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskInput {
@@ -199,24 +200,101 @@ pub fn delete(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// Add checklist-like child tasks beneath a parent task. The caller wraps
+/// this in a transaction so either every requested step is created or none
+/// are. Child tasks inherit planning context but not the outcome's estimate.
+pub fn create_steps(conn: &Connection, parent_id: i64, steps: &[String]) -> AppResult<Vec<Task>> {
+    let parent = get(conn, parent_id)?;
+    if matches!(parent.status.as_str(), "completed" | "cancelled") {
+        return Err(AppError::invalid(
+            "Completed or cancelled tasks cannot be broken into new steps.",
+        ));
+    }
+    if steps.is_empty() {
+        return Err(AppError::invalid("Add at least one action step."));
+    }
+
+    let existing: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT title FROM tasks WHERE parent_task_id=?1")?;
+        let rows = stmt.query_map([parent_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if existing.len() + steps.len() > MAX_TASK_STEPS {
+        return Err(AppError::invalid(format!(
+            "A task can have at most {MAX_TASK_STEPS} direct action steps."
+        )));
+    }
+
+    let mut seen = existing
+        .iter()
+        .map(|title| title.trim().to_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    let mut prepared = Vec::with_capacity(steps.len());
+    for step in steps {
+        let title = step.trim();
+        if title.is_empty() {
+            return Err(AppError::invalid("Action steps cannot be empty."));
+        }
+        if title.chars().count() > 300 {
+            return Err(AppError::invalid(
+                "Action steps must be 300 characters or fewer.",
+            ));
+        }
+        if !seen.insert(title.to_lowercase()) {
+            return Err(AppError::invalid(format!(
+                "This task already has an action step named \"{title}\"."
+            )));
+        }
+        prepared.push(title.to_string());
+    }
+
+    prepared
+        .into_iter()
+        .map(|title| {
+            create(
+                conn,
+                &TaskInput {
+                    title,
+                    description: String::new(),
+                    project_id: parent.project_id,
+                    parent_task_id: Some(parent_id),
+                    status: "planned".into(),
+                    priority: parent.priority.clone(),
+                    estimated_minutes: None,
+                    due_date: parent.due_date.clone(),
+                    tags: vec![],
+                },
+            )
+        })
+        .collect()
+}
+
 pub fn list(conn: &Connection, status: Option<&str>, search: Option<&str>) -> AppResult<Vec<Task>> {
-    let mut sql = String::from("SELECT * FROM tasks WHERE 1=1");
+    let mut sql = String::from("SELECT task.* FROM tasks task WHERE 1=1");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![];
     if let Some(s) = status {
-        sql.push_str(" AND status = ?");
+        sql.push_str(" AND task.status = ?");
         args.push(Box::new(s.to_string()));
     } else {
-        sql.push_str(" AND status NOT IN ('completed','cancelled')");
+        // Keep checked steps visible while their parent outcome remains open.
+        sql.push_str(
+            " AND (task.status NOT IN ('completed','cancelled')
+                    OR EXISTS(
+                      SELECT 1 FROM tasks parent
+                      WHERE parent.id=task.parent_task_id
+                        AND parent.status NOT IN ('completed','cancelled')
+                    ))",
+        );
     }
     if let Some(q) = search {
         if !q.trim().is_empty() {
-            sql.push_str(" AND (title LIKE ? OR description LIKE ?)");
+            sql.push_str(" AND (task.title LIKE ? OR task.description LIKE ?)");
             let like = format!("%{}%", q.trim());
             args.push(Box::new(like.clone()));
             args.push(Box::new(like));
         }
     }
-    sql.push_str(" ORDER BY CASE priority WHEN 'must' THEN 0 WHEN 'should' THEN 1 ELSE 2 END, created_at DESC");
+    sql.push_str(" ORDER BY CASE task.priority WHEN 'must' THEN 0 WHEN 'should' THEN 1 ELSE 2 END, task.created_at DESC, task.id DESC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args), task_from_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -280,4 +358,79 @@ pub fn list_projects(conn: &Connection) -> AppResult<Vec<Project>> {
 pub fn archive_project(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("UPDATE projects SET archived=1 WHERE id=?1", [id])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_input(title: &str) -> TaskInput {
+        TaskInput {
+            title: title.into(),
+            description: String::new(),
+            project_id: None,
+            parent_task_id: None,
+            status: "inbox".into(),
+            priority: "must".into(),
+            estimated_minutes: Some(90),
+            due_date: Some("2026-09-01".into()),
+            tags: vec!["launch".into()],
+        }
+    }
+
+    fn connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn task_steps_are_children_and_stay_visible_after_completion() {
+        let conn = connection();
+        let parent = create(&conn, &task_input("Publish launch page")).unwrap();
+        let steps = create_steps(
+            &conn,
+            parent.id,
+            &["Write the copy".into(), "Publish the page".into()],
+        )
+        .unwrap();
+
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|step| step.parent_task_id == Some(parent.id)));
+        assert!(steps.iter().all(|step| step.project_id == parent.project_id));
+        assert!(steps.iter().all(|step| step.due_date == parent.due_date));
+        assert!(steps.iter().all(|step| step.estimated_minutes.is_none()));
+
+        set_status(&conn, steps[0].id, "completed").unwrap();
+        let open = list(&conn, None, None).unwrap();
+        assert!(open.iter().any(|task| task.id == steps[0].id));
+
+        set_status(&conn, parent.id, "completed").unwrap();
+        let open = list(&conn, None, None).unwrap();
+        assert!(!open.iter().any(|task| task.id == parent.id));
+        assert!(!open.iter().any(|task| task.id == steps[0].id));
+    }
+
+    #[test]
+    fn task_steps_reject_duplicates_before_writing() {
+        let conn = connection();
+        let parent = create(&conn, &task_input("Prepare the review")).unwrap();
+        let error = create_steps(
+            &conn,
+            parent.id,
+            &["Gather notes".into(), " gather NOTES ".into()],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("already has an action step"), "{error}");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE parent_task_id=?1",
+                [parent.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }
