@@ -22,6 +22,12 @@ export function flattenTaskHierarchy(tasks: Task[]): TaskHierarchyRow[] {
     siblings.push(task);
     children.set(task.parent_task_id, siblings);
   }
+  // Child IDs reflect insertion order even when several AI-generated steps
+  // share the same second-resolution created_at timestamp. Keep that sequence
+  // stable regardless of the broader backlog sort returned by SQLite.
+  for (const siblings of children.values()) {
+    siblings.sort((left, right) => left.id - right.id);
+  }
 
   const rows: TaskHierarchyRow[] = [];
   const visited = new Set<number>();

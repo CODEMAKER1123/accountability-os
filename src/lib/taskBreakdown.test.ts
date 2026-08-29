@@ -28,14 +28,16 @@ describe("task breakdown helpers", () => {
   it("places steps beneath their parent without hiding filtered orphans", () => {
     const parent = task(1, "Publish the report");
     const child = task(2, "Proofread the report", 1);
+    const secondChild = task(5, "Send the report", 1);
     const grandchild = task(3, "Check the totals", 2);
     const orphan = task(4, "Email the report", 99);
 
-    expect(flattenTaskHierarchy([child, orphan, parent, grandchild])).toEqual([
+    expect(flattenTaskHierarchy([secondChild, child, orphan, parent, grandchild])).toEqual([
       { task: orphan, depth: 0, directChildren: [] },
-      { task: parent, depth: 0, directChildren: [child] },
+      { task: parent, depth: 0, directChildren: [child, secondChild] },
       { task: child, depth: 1, directChildren: [grandchild] },
       { task: grandchild, depth: 2, directChildren: [] },
+      { task: secondChild, depth: 1, directChildren: [] },
     ]);
   });
 

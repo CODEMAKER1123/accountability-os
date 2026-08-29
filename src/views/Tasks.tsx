@@ -501,6 +501,7 @@ function TaskEditor({
               await api.updateTask(task.id, {
                 title: form.title,
                 description: form.description,
+                parent_task_id: task.parent_task_id,
                 priority: form.priority,
                 status: form.status,
                 project_id: form.project_id,
