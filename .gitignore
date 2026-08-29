@@ -27,3 +27,6 @@ src-tauri/gen/
 
 # Logs
 *.log
+
+# Local browser-test artifacts
+output/

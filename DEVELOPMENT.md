@@ -41,7 +41,7 @@ On Windows:
 ```bash
 npm install
 npx tauri build
-# → target/release/bundle/nsis/Accountability OS_0.1.0_x64-setup.exe
+# → target/release/bundle/nsis/Accountability OS_<version>_x64-setup.exe
 ```
 
 Or let CI do it: the **Windows installer** GitHub Actions workflow builds the NSIS installer on

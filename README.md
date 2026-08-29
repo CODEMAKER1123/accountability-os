@@ -74,5 +74,6 @@ pipeline, on any OS.
 - [DATABASE.md](DATABASE.md) — SQLite schema
 - [MONITORING.md](MONITORING.md) — the probe, aggregation, idle/lock semantics
 - [AI.md](AI.md) — provider abstraction, payloads, cost control
+- [UPDATES.md](UPDATES.md) — signed in-app updates and the release process
 - [BROWSER_EXTENSION.md](BROWSER_EXTENSION.md) — install & pairing
 - [DEVELOPMENT.md](DEVELOPMENT.md) — build, test, reset, troubleshoot

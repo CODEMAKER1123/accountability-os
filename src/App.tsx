@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 
 import BlockedModal from "@/components/BlockedModal";
+import AppUpdater from "@/components/AppUpdater";
 import BreakModal from "@/components/BreakModal";
 import Interview from "@/components/Interview";
 import Onboarding from "@/components/Onboarding";
@@ -106,6 +107,7 @@ export default function App() {
           ))}
         </nav>
         <div className="mt-auto space-y-2 border-t border-ink-700 p-3">
+          <AppUpdater />
           {snapshot && (
             <MonitoringBadge
               state={snapshot.monitoring_state}
