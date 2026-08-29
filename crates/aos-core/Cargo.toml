@@ -1,0 +1,12 @@
+[package]
+name = "aos-core"
+description = "Accountability OS core domain logic: aggregation, classification, scoring, accountability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Accountability OS Companion — Options</title>
+    <style>
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #101317;
+        color: #dde2e8;
+        max-width: 480px;
+        margin: 40px auto;
+        padding: 0 16px;
+        font-size: 14px;
+      }
+      h1 { font-size: 16px; }
+      label { display: block; margin-top: 16px; font-size: 12px; color: #8f99a5; text-transform: uppercase; letter-spacing: 0.05em; }
+      input {
+        width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px;
+        background: #191e24; color: #dde2e8; border: 1px solid #2f3843; border-radius: 6px; font-size: 14px;
+      }
+      button {
+        margin-top: 16px; margin-right: 8px; padding: 8px 14px; background: #2f3843; color: #f2f4f6;
+        border: 1px solid #4a5561; border-radius: 6px; cursor: pointer; font-size: 13px;
+      }
+      button:hover { background: #3a4550; }
+      #status { margin-top: 12px; font-size: 13px; }
+      .ok { color: #4ea87c; }
+      .err { color: #c96f5e; }
+      p.note { color: #8f99a5; font-size: 12px; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <h1>Accountability OS Companion</h1>
+    <p class="note">
+      This extension reports only the active tab's domain and title, only while the browser is the
+      focused window, and only to the Accountability OS app on this machine (127.0.0.1). Find the
+      pairing token in the desktop app under Settings → Browser extension.
+    </p>
+    <label for="port">Local port</label>
+    <input id="port" type="number" min="1024" max="65535" />
+    <label for="token">Pairing token</label>
+    <input id="token" type="password" autocomplete="off" />
+    <div>
+      <button id="save">Save</button>
+      <button id="test">Test connection</button>
+    </div>
+    <div id="status"></div>
+    <script src="options.js"></script>
+  </body>
+</html>
