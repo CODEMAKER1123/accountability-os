@@ -6,6 +6,7 @@ export interface InterviewCandidate {
   key: string;
   source: CandidateSource;
   title: string;
+  commitment_id: number | null;
   task_id: number | null;
   selected: boolean;
   priority: Priority;
@@ -123,7 +124,8 @@ export function reconcileQuestionOneCandidates(
       key: `q1-${index}`,
       source: "q1",
       title,
-      task_id: null,
+      commitment_id: prior?.commitment_id ?? null,
+      task_id: prior?.task_id ?? null,
       selected,
       priority: prior?.priority ?? "must",
       done_definition: prior?.done_definition ?? "",

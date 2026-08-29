@@ -7,7 +7,7 @@ import { api, errorMessage, type Settings, type TodaySnapshot } from "./ipc";
 export type View = "today" | "tasks" | "plan" | "activity" | "scorecard" | "settings";
 
 export type Modal =
-  | { kind: "interview" }
+  | { kind: "interview"; mode?: "new" | "edit" }
   | { kind: "review" }
   | { kind: "switch"; fromCommitmentId: number | null; toCommitmentId?: number | null }
   | { kind: "blocked"; commitmentId: number }

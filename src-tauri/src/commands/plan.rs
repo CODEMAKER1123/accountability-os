@@ -6,7 +6,7 @@ use tauri::State;
 use aos_core::events::AppEvent;
 
 use crate::db::models::{Commitment, DailyPlan};
-use crate::db::plans::{self, LockDayInput};
+use crate::db::plans::{self, LockDayInput, ReviseDayInput};
 use crate::db::{now, today_local};
 use crate::engine::emit_event;
 use crate::error::{AppError, AppResult};
@@ -55,6 +55,38 @@ pub fn lock_day(
         engine.interview_snoozed_until = None;
     }
     emit_event(&app, &AppEvent::DayLocked { plan_id: plan.id });
+    Ok(TodayPlan {
+        plan: Some(plan),
+        commitments,
+    })
+}
+
+/// Edit today's locked contract without discarding focus history or progress.
+#[tauri::command]
+pub fn revise_day(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    input: ReviseDayInput,
+) -> AppResult<TodayPlan> {
+    if input.date != today_local() {
+        return Err(AppError::invalid("Only today's plan can be edited."));
+    }
+    let (plan, commitments) = state.db.with_tx(|tx| plans::revise_day(tx, &input))?;
+    {
+        let mut engine = state.engine.lock();
+        if let Some(active) = engine.active_commitment.as_mut() {
+            if let Some(updated) = commitments.iter().find(|item| item.id == active.id) {
+                active.title = updated.title.clone();
+                active.done_definition = updated.done_definition.clone();
+            }
+        }
+    }
+    emit_event(
+        &app,
+        &AppEvent::CommitmentChanged {
+            commitment_id: None,
+        },
+    );
     Ok(TodayPlan {
         plan: Some(plan),
         commitments,
