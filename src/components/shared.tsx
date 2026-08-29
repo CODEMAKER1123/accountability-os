@@ -143,3 +143,38 @@ export function EmptyState({ title, hint }: { title: string; hint?: string }) {
     </div>
   );
 }
+
+export function ErrorBanner({
+  message,
+  onDismiss,
+  onRetry,
+}: {
+  message: string;
+  onDismiss?: () => void;
+  onRetry?: () => void;
+}) {
+  return (
+    <div
+      className="flex items-start justify-between gap-3 rounded-md border border-distracted/40 bg-distracted/10 px-3 py-2 text-xs text-ink-100"
+      role="alert"
+    >
+      <p className="min-w-0 leading-relaxed">{message}</p>
+      <div className="flex shrink-0 gap-2">
+        {onRetry && (
+          <button className="font-medium text-ink-100 hover:text-white" onClick={onRetry}>
+            Retry
+          </button>
+        )}
+        {onDismiss && (
+          <button
+            className="text-ink-400 hover:text-ink-100"
+            aria-label="Dismiss error"
+            onClick={onDismiss}
+          >
+            ✕
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}

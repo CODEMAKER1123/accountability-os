@@ -8,7 +8,7 @@ Updates are never installed silently. The update manifest and Windows updater bu
 
 1. Bump the version in `package.json`, the root `Cargo.toml`, and `src-tauri/tauri.conf.json`.
 2. Merge the tested change to `main`.
-3. Create and push the matching tag, such as `v0.2.0`.
+3. Create and push the matching tag, such as `v0.3.0`.
 4. Approve the protected `release` environment deployment in GitHub Actions.
 5. The `Publish signed updater release` workflow builds the signed NSIS updater, creates the GitHub Release, and uploads `latest.json`.
 

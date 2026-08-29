@@ -3,15 +3,25 @@
 
 import { useEffect, useState } from "react";
 
-import { ClassBadge, PriorityTag, ProgressBar, ScoreRing } from "@/components/shared";
+import { ClassBadge, ErrorBanner, PriorityTag, ProgressBar, ScoreRing } from "@/components/shared";
 import { CommitmentSteps } from "@/components/CommitmentSteps";
-import { api, type Commitment } from "@/lib/ipc";
+import { api, errorMessage, type Commitment } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 import { fmtClockDuration, fmtDuration, fmtTime } from "@/lib/time";
 
 export default function Today() {
   const { snapshot, refreshSnapshot, setModal } = useStore();
   const [, forceTick] = useState(0);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const runAction = async (action: () => Promise<void>) => {
+    setActionError(null);
+    try {
+      await action();
+    } catch (error) {
+      setActionError(errorMessage(error));
+    }
+  };
 
   // Local 1s ticker so timers run smoothly between 5s snapshot refreshes.
   useEffect(() => {
@@ -64,6 +74,10 @@ export default function Today() {
         </div>
       </div>
 
+      {actionError && (
+        <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
+      )}
+
       {/* Break banner */}
       {onBreak && snapshot.current_break && (
         <div className="card flex items-center justify-between border-accent/40">
@@ -76,10 +90,12 @@ export default function Today() {
           </div>
           <button
             className="btn"
-            onClick={async () => {
-              await api.endBreakNow();
-              await refreshSnapshot();
-            }}
+            onClick={() =>
+              void runAction(async () => {
+                await api.endBreakNow();
+                await refreshSnapshot();
+              })
+            }
           >
             End break now
           </button>
@@ -95,19 +111,8 @@ export default function Today() {
             snapshot.commitment_progress.find((p) => p.commitment_id === active.id)?.focused_secs ??
             0
           }
+          onError={setActionError}
         />
-      ) : planLocked && !dayEnded && pending.length > 0 ? (
-        <div className="card">
-          <p className="section-title mb-3">Pick up a commitment</p>
-          <div className="space-y-2">
-            {pending.map((c) => (
-              // activeId still passed: an overnight focus session can leave a
-              // commitment active that isn't in today's list — starting a new
-              // one must still go through the switch flow.
-              <CommitmentRow key={c.id} commitment={c} activeId={active?.id ?? null} />
-            ))}
-          </div>
-        </div>
       ) : !planLocked ? (
         <div className="card flex items-center justify-between">
           <div>
@@ -125,10 +130,20 @@ export default function Today() {
       {/* Commitments list */}
       {planLocked && snapshot.commitments.length > 0 && (
         <div className="card">
-          <p className="section-title mb-3">Today's commitments</p>
+          <p className="section-title">Today's commitments</p>
+          {!active && !dayEnded && pending.length > 0 && (
+            <p className="mb-3 mt-1 text-xs text-ink-400">
+              Choose one commitment to begin a focus session.
+            </p>
+          )}
           <div className="space-y-2">
             {snapshot.commitments.map((c) => (
-              <CommitmentRow key={c.id} commitment={c} activeId={active?.id ?? null} />
+              <CommitmentRow
+                key={c.id}
+                commitment={c}
+                activeId={active?.id ?? null}
+                onError={setActionError}
+              />
             ))}
           </div>
         </div>
@@ -219,13 +234,29 @@ function ActiveCommitmentCard({
   commitment,
   focusElapsed,
   focusedSecs,
+  onError,
 }: {
   commitment: Commitment;
   focusElapsed: number;
   focusedSecs: number;
+  onError: (message: string | null) => void;
 }) {
   const { refreshSnapshot, setModal } = useStore();
+  const [busyAction, setBusyAction] = useState<"complete" | "pause" | null>(null);
   const est = (commitment.estimated_minutes ?? 0) * 60;
+  const perform = async (kind: "complete" | "pause", action: () => Promise<unknown>) => {
+    if (busyAction) return;
+    setBusyAction(kind);
+    onError(null);
+    try {
+      await action();
+      await refreshSnapshot();
+    } catch (error) {
+      onError(errorMessage(error));
+    } finally {
+      setBusyAction(null);
+    }
+  };
   return (
     <div className="card border-focus/30">
       <div className="flex items-start justify-between gap-4">
@@ -255,21 +286,17 @@ function ActiveCommitmentCard({
       <div className="mt-4 flex gap-2">
         <button
           className="btn btn-primary"
-          onClick={async () => {
-            await api.completeCommitment(commitment.id);
-            await refreshSnapshot();
-          }}
+          disabled={busyAction != null}
+          onClick={() => void perform("complete", () => api.completeCommitment(commitment.id))}
         >
-          Complete
+          {busyAction === "complete" ? "Completing…" : "Complete"}
         </button>
         <button
           className="btn"
-          onClick={async () => {
-            await api.pauseFocus();
-            await refreshSnapshot();
-          }}
+          disabled={busyAction != null}
+          onClick={() => void perform("pause", () => api.pauseFocus())}
         >
-          Pause
+          {busyAction === "pause" ? "Pausing…" : "Pause"}
         </button>
         <button className="btn" onClick={() => setModal({ kind: "blocked", commitmentId: commitment.id })}>
           Blocked
@@ -288,17 +315,22 @@ function ActiveCommitmentCard({
 function CommitmentRow({
   commitment,
   activeId = null,
+  onError,
 }: {
   commitment: Commitment;
   activeId?: number | null;
+  onError: (message: string | null) => void;
 }) {
   const { refreshSnapshot, snapshot, setModal } = useStore();
+  const [starting, setStarting] = useState(false);
   const done = commitment.status === "completed";
   const isActive = commitment.id === activeId;
   const pausedContractId =
     activeId == null ? snapshot?.commitments.find((c) => c.status === "active")?.id ?? null : null;
   const contractId = activeId ?? pausedContractId;
   const isPausedContract = !isActive && commitment.id === pausedContractId;
+  const isTerminal = commitment.status === "deferred" || commitment.status === "cancelled";
+  const requiresSwitch = contractId != null && !isPausedContract;
   const focused =
     snapshot?.commitment_progress.find((p) => p.commitment_id === commitment.id)?.focused_secs ?? 0;
   return (
@@ -326,7 +358,7 @@ function CommitmentRow({
         <span className="text-xs text-focus">Done</span>
       ) : isActive ? (
         <span className="text-xs text-focus">Active</span>
-      ) : commitment.status === "deferred" || commitment.status === "cancelled" ? null : contractId != null && !isPausedContract ? (
+      ) : isTerminal ? null : requiresSwitch ? (
         <button
           className="btn py-1"
           onClick={() => setModal({ kind: "switch", fromCommitmentId: contractId })}
@@ -336,6 +368,7 @@ function CommitmentRow({
       ) : (
         <button
           className="btn py-1"
+          disabled={starting}
           onClick={async () => {
             if (activeId != null && activeId !== commitment.id) {
               // Another commitment is active: switching must be intentional —
@@ -347,11 +380,20 @@ function CommitmentRow({
               });
               return;
             }
-            await api.startCommitment(commitment.id);
-            await refreshSnapshot();
+            if (starting) return;
+            setStarting(true);
+            onError(null);
+            try {
+              await api.startCommitment(commitment.id);
+              await refreshSnapshot();
+            } catch (error) {
+              onError(errorMessage(error));
+            } finally {
+              setStarting(false);
+            }
           }}
         >
-          {isPausedContract ? "Resume" : "Start"}
+          {starting ? "Starting…" : isPausedContract ? "Resume" : "Start"}
         </button>
       )}
     </div>

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { EmptyState, PriorityTag } from "@/components/shared";
+import { EmptyState, ErrorBanner, PriorityTag } from "@/components/shared";
 import {
   api,
   errorMessage,
@@ -30,6 +30,7 @@ export default function Tasks() {
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Task | null>(null);
+  const [showProjects, setShowProjects] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -37,6 +38,7 @@ export default function Tasks() {
       const [t, p] = await Promise.all([api.listTasks(status, search || null), api.listProjects()]);
       setTasks(t);
       setProjects(p);
+      setError(null);
     } catch (e) {
       setError(errorMessage(e));
     }
@@ -48,17 +50,24 @@ export default function Tasks() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <h1 className="text-lg font-semibold text-ink-50">Tasks</h1>
-        <input
-          className="input w-64"
-          placeholder="Search tasks…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
+        <div className="flex items-center gap-2">
+          <button className="btn" onClick={() => setShowProjects((visible) => !visible)}>
+            {showProjects ? "Hide projects" : `Projects${projects.length ? ` (${projects.length})` : ""}`}
+          </button>
+          <input
+            className="input w-64"
+            placeholder="Search tasks…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
       </div>
 
-      <QuickAdd projects={projects} onAdded={reload} />
+      {showProjects && <ProjectPanel projects={projects} onChanged={reload} />}
+
+      <QuickAdd projects={projects} onAdded={reload} onError={setError} />
 
       <div className="flex gap-1">
         {STATUS_FILTERS.map((f) => (
@@ -74,12 +83,18 @@ export default function Tasks() {
         ))}
       </div>
 
-      {error && <p className="text-xs text-distracted">{error}</p>}
+      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
       {tasks.length === 0 ? (
         <EmptyState
           title="No tasks here"
-          hint="Capture anything with the field above, or press Ctrl+Shift+Space from anywhere."
+          hint={
+            search
+              ? "No tasks match this search."
+              : filter === "open"
+                ? "Add your first task above, or create a project to organize related work."
+                : `There are no ${filter} tasks. Choose Open to see everything still actionable.`
+          }
         />
       ) : (
         <div className="divide-y divide-ink-800 rounded-lg border border-ink-700 bg-ink-900">
@@ -91,6 +106,7 @@ export default function Tasks() {
               onChanged={reload}
               editing={editing?.id === t.id}
               setEditing={(open) => setEditing(open ? t : null)}
+              onError={setError}
             />
           ))}
         </div>
@@ -99,7 +115,101 @@ export default function Tasks() {
   );
 }
 
-function QuickAdd({ projects, onAdded }: { projects: Project[]; onAdded: () => Promise<void> }) {
+function ProjectPanel({
+  projects,
+  onChanged,
+}: {
+  projects: Project[];
+  onChanged: () => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [color, setColor] = useState("#4ea87c");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const create = async () => {
+    if (!name.trim() || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.createProject(name.trim(), color);
+      setName("");
+      await onChanged();
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="card space-y-3" aria-labelledby="projects-heading">
+      <div>
+        <p id="projects-heading" className="section-title">
+          Projects
+        </p>
+        <p className="mt-1 text-xs text-ink-400">
+          Group related backlog tasks, then choose the project while adding or editing a task.
+        </p>
+      </div>
+      <div className="flex gap-2">
+        <input
+          className="input flex-1"
+          placeholder="New project name…"
+          value={name}
+          maxLength={200}
+          onChange={(event) => setName(event.target.value)}
+          onKeyDown={(event) => event.key === "Enter" && void create()}
+        />
+        <label className="flex items-center gap-2 rounded-md border border-ink-700 px-2 text-xs text-ink-400">
+          Color
+          <input
+            className="h-6 w-8 cursor-pointer border-0 bg-transparent p-0"
+            type="color"
+            value={color}
+            onChange={(event) => setColor(event.target.value)}
+          />
+        </label>
+        <button
+          className="btn btn-primary"
+          disabled={!name.trim() || busy}
+          onClick={() => void create()}
+        >
+          {busy ? "Creating…" : "Create project"}
+        </button>
+      </div>
+      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {projects.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {projects.map((project) => (
+            <span
+              key={project.id}
+              className="inline-flex items-center gap-2 rounded-full border border-ink-700 bg-ink-850 px-2.5 py-1 text-xs text-ink-200"
+            >
+              <span
+                className="h-2 w-2 rounded-full"
+                style={{ backgroundColor: project.color ?? "#697684" }}
+              />
+              {project.name}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className="text-xs text-ink-500">No projects yet.</p>
+      )}
+    </section>
+  );
+}
+
+function QuickAdd({
+  projects,
+  onAdded,
+  onError,
+}: {
+  projects: Project[];
+  onAdded: () => Promise<void>;
+  onError: (message: string | null) => void;
+}) {
   const [title, setTitle] = useState("");
   const [priority, setPriority] = useState<Priority>("should");
   const [projectId, setProjectId] = useState<number | "">("");
@@ -107,6 +217,7 @@ function QuickAdd({ projects, onAdded }: { projects: Project[]; onAdded: () => P
   const submit = async () => {
     if (!title.trim() || busy) return;
     setBusy(true);
+    onError(null);
     try {
       await api.createTask({
         title: title.trim(),
@@ -116,6 +227,8 @@ function QuickAdd({ projects, onAdded }: { projects: Project[]; onAdded: () => P
       });
       setTitle("");
       await onAdded();
+    } catch (caught) {
+      onError(errorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -150,8 +263,12 @@ function QuickAdd({ projects, onAdded }: { projects: Project[]; onAdded: () => P
           </option>
         ))}
       </select>
-      <button className="btn btn-primary" onClick={() => void submit()} disabled={!title.trim()}>
-        Add
+      <button
+        className="btn btn-primary"
+        onClick={() => void submit()}
+        disabled={!title.trim() || busy}
+      >
+        {busy ? "Adding…" : "Add"}
       </button>
     </div>
   );
@@ -163,12 +280,14 @@ function TaskRow({
   onChanged,
   editing,
   setEditing,
+  onError,
 }: {
   task: Task;
   projects: Project[];
   onChanged: () => Promise<void>;
   editing: boolean;
   setEditing: (open: boolean) => void;
+  onError: (message: string | null) => void;
 }) {
   const project = projects.find((p) => p.id === task.project_id);
   const done = task.status === "completed";
@@ -180,12 +299,19 @@ function TaskRow({
           className="h-3.5 w-3.5 accent-[#4ea87c]"
           checked={done}
           onChange={async (e) => {
-            await api.setTaskStatus(task.id, e.target.checked ? "completed" : "planned");
-            await onChanged();
+            onError(null);
+            try {
+              await api.setTaskStatus(task.id, e.target.checked ? "completed" : "planned");
+              await onChanged();
+            } catch (caught) {
+              onError(errorMessage(caught));
+            }
           }}
         />
         <button className="min-w-0 flex-1 text-left" onClick={() => setEditing(!editing)}>
-          <span className={`block truncate text-[13px] ${done ? "text-ink-500 line-through" : "text-ink-100"}`}>
+          <span
+            className={`block truncate text-[13px] ${done ? "text-ink-500 line-through" : "text-ink-100"}`}
+          >
             {task.title}
           </span>
           <span className="text-2xs text-ink-500">
@@ -201,14 +327,28 @@ function TaskRow({
           className="btn-ghost btn px-2 py-1 text-ink-500 hover:text-distracted"
           title="Delete task"
           onClick={async () => {
-            await api.deleteTask(task.id);
-            await onChanged();
+            onError(null);
+            try {
+              await api.deleteTask(task.id);
+              await onChanged();
+            } catch (caught) {
+              onError(errorMessage(caught));
+            }
           }}
         >
           ✕
         </button>
       </div>
-      {editing && <TaskEditor task={task} projects={projects} onSaved={async () => { setEditing(false); await onChanged(); }} />}
+      {editing && (
+        <TaskEditor
+          task={task}
+          projects={projects}
+          onSaved={async () => {
+            setEditing(false);
+            await onChanged();
+          }}
+        />
+      )}
     </div>
   );
 }

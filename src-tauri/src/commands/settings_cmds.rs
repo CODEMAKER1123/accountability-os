@@ -640,7 +640,7 @@ pub fn set_widget_visible(app: tauri::AppHandle, state: State<'_, AppState>, vis
     tauri::WebviewWindowBuilder::new(
         &app,
         "widget",
-        tauri::WebviewUrl::App("index.html?window=widget".into()),
+        tauri::WebviewUrl::App("index.html".into()),
     )
     .title("Focus")
     .inner_size(280.0, 200.0)
@@ -665,7 +665,7 @@ pub fn open_quick_capture(app: tauri::AppHandle) -> AppResult<()> {
     tauri::WebviewWindowBuilder::new(
         &app,
         "capture",
-        tauri::WebviewUrl::App("index.html?window=capture".into()),
+        tauri::WebviewUrl::App("index.html".into()),
     )
     .title("Quick Capture")
     .inner_size(560.0, 190.0)

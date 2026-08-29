@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 
-import { api, type Settings, type TodaySnapshot } from "./ipc";
+import { api, errorMessage, type Settings, type TodaySnapshot } from "./ipc";
 
 export type View = "today" | "tasks" | "plan" | "activity" | "scorecard" | "settings";
 
@@ -21,6 +21,7 @@ interface Store {
   modal: Modal;
   setModal: (m: Modal) => void;
   snapshot: TodaySnapshot | null;
+  snapshotError: string | null;
   refreshSnapshot: () => Promise<void>;
   settings: Settings | null;
   loadSettings: () => Promise<Settings>;
@@ -33,12 +34,14 @@ export const useStore = create<Store>((set) => ({
   modal: null,
   setModal: (modal) => set({ modal }),
   snapshot: null,
+  snapshotError: null,
   refreshSnapshot: async () => {
     try {
       const snapshot = await api.getTodaySnapshot();
-      set({ snapshot });
+      set({ snapshot, snapshotError: null });
     } catch (e) {
       console.error("snapshot refresh failed", e);
+      set({ snapshotError: errorMessage(e) });
     }
   },
   settings: null,
