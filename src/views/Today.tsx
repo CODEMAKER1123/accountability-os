@@ -341,78 +341,102 @@ function CommitmentRow({
 }) {
   const { refreshSnapshot, snapshot, setModal } = useStore();
   const [starting, setStarting] = useState(false);
+  const [showSteps, setShowSteps] = useState(false);
   const done = commitment.status === "completed";
   const isActive = commitment.id === activeId;
   const pausedContractId =
     activeId == null ? snapshot?.commitments.find((c) => c.status === "active")?.id ?? null : null;
   const contractId = activeId ?? pausedContractId;
   const isPausedContract = !isActive && commitment.id === pausedContractId;
-  const isTerminal = commitment.status === "deferred" || commitment.status === "cancelled";
+  const isTerminal = ["completed", "deferred", "dropped", "cancelled"].includes(
+    commitment.status,
+  );
   const requiresSwitch = contractId != null && !isPausedContract;
   const focused =
     snapshot?.commitment_progress.find((p) => p.commitment_id === commitment.id)?.focused_secs ?? 0;
   return (
     <div
-      className={`flex items-center gap-3 rounded-md border px-3 py-2 ${
+      className={`rounded-md border px-3 py-2 ${
         isActive ? "border-focus/40 bg-focus/5" : "border-ink-700 bg-ink-850"
       }`}
     >
-      <span className="w-4 text-center font-mono text-xs text-ink-500">{commitment.rank}</span>
-      <div className="min-w-0 flex-1">
-        <p className={`truncate text-[13px] ${done ? "text-ink-500 line-through" : "text-ink-100"}`}>
-          {commitment.title}
-        </p>
-        <p className="text-2xs text-ink-500">
-          {fmtDuration(focused)} focused
-          {commitment.estimated_minutes ? ` · est ${commitment.estimated_minutes}m` : ""}
-          {commitment.status === "deferred" && " · deferred"}
-          {commitment.status === "cancelled" && " · cancelled"}
-          {commitment.steps.length > 0 &&
-            ` · ${commitment.steps.filter((step) => step.completed).length}/${commitment.steps.length} steps`}
-        </p>
+      <div className="flex items-center gap-3">
+        <span className="w-4 text-center font-mono text-xs text-ink-500">{commitment.rank}</span>
+        <div className="min-w-0 flex-1">
+          <p className={`truncate text-[13px] ${done ? "text-ink-500 line-through" : "text-ink-100"}`}>
+            {commitment.title}
+          </p>
+          <p className="text-2xs text-ink-500">
+            {fmtDuration(focused)} focused
+            {commitment.estimated_minutes ? ` · est ${commitment.estimated_minutes}m` : ""}
+            {commitment.status === "deferred" && " · deferred"}
+            {commitment.status === "cancelled" && " · cancelled"}
+            {commitment.steps.length > 0 &&
+              ` · ${commitment.steps.filter((step) => step.completed).length}/${commitment.steps.length} steps`}
+          </p>
+        </div>
+        {!isTerminal && (
+          <button
+            className="btn btn-ghost shrink-0 px-2 py-1 text-accent"
+            aria-expanded={showSteps}
+            onClick={() => setShowSteps((open) => !open)}
+          >
+            {showSteps
+              ? "Hide steps"
+              : commitment.steps.length > 0
+                ? "Show steps"
+                : "Break into steps"}
+          </button>
+        )}
+        <PriorityTag priority={commitment.priority} />
+        {done ? (
+          <span className="text-xs text-focus">Done</span>
+        ) : isActive ? (
+          <span className="text-xs text-focus">Active</span>
+        ) : isTerminal ? null : requiresSwitch ? (
+          <button
+            className="btn py-1"
+            onClick={() => setModal({ kind: "switch", fromCommitmentId: contractId })}
+          >
+            Switch
+          </button>
+        ) : (
+          <button
+            className="btn py-1"
+            disabled={starting}
+            onClick={async () => {
+              if (activeId != null && activeId !== commitment.id) {
+                // Another commitment is active: switching must be intentional —
+                // collect the reason + disposition (spec §7, §15).
+                setModal({
+                  kind: "switch",
+                  fromCommitmentId: activeId,
+                  toCommitmentId: commitment.id,
+                });
+                return;
+              }
+              if (starting) return;
+              setStarting(true);
+              onError(null);
+              try {
+                await api.startCommitment(commitment.id);
+                await refreshSnapshot();
+              } catch (error) {
+                onError(errorMessage(error));
+              } finally {
+                setStarting(false);
+              }
+            }}
+          >
+            {starting ? "Starting…" : isPausedContract ? "Resume" : "Start"}
+          </button>
+        )}
       </div>
-      <PriorityTag priority={commitment.priority} />
-      {done ? (
-        <span className="text-xs text-focus">Done</span>
-      ) : isActive ? (
-        <span className="text-xs text-focus">Active</span>
-      ) : isTerminal ? null : requiresSwitch ? (
-        <button
-          className="btn py-1"
-          onClick={() => setModal({ kind: "switch", fromCommitmentId: contractId })}
-        >
-          Switch
-        </button>
-      ) : (
-        <button
-          className="btn py-1"
-          disabled={starting}
-          onClick={async () => {
-            if (activeId != null && activeId !== commitment.id) {
-              // Another commitment is active: switching must be intentional —
-              // collect the reason + disposition (spec §7, §15).
-              setModal({
-                kind: "switch",
-                fromCommitmentId: activeId,
-                toCommitmentId: commitment.id,
-              });
-              return;
-            }
-            if (starting) return;
-            setStarting(true);
-            onError(null);
-            try {
-              await api.startCommitment(commitment.id);
-              await refreshSnapshot();
-            } catch (error) {
-              onError(errorMessage(error));
-            } finally {
-              setStarting(false);
-            }
-          }}
-        >
-          {starting ? "Starting…" : isPausedContract ? "Resume" : "Start"}
-        </button>
+      {showSteps && (
+        <CommitmentSteps
+          commitment={commitment}
+          initiallyBreakingDown={commitment.steps.length === 0}
+        />
       )}
     </div>
   );

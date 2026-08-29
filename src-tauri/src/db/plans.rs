@@ -254,10 +254,17 @@ fn normalized_step_title(title: &str) -> String {
         .to_lowercase()
 }
 
+type PreparedRevision = (
+    DailyPlan,
+    Vec<Commitment>,
+    Vec<Vec<String>>,
+    RevisionImpact,
+);
+
 fn prepare_revision(
     conn: &Connection,
     input: &ReviseDayInput,
-) -> AppResult<(DailyPlan, Vec<Commitment>, Vec<Vec<String>>, RevisionImpact)> {
+) -> AppResult<PreparedRevision> {
     let validation_input = input.validation_input();
     let prepared_steps = validate_day_input(&validation_input)?;
     let plan = get_plan_by_date(conn, &input.date)?
@@ -687,6 +694,37 @@ pub fn set_commitment_step_completed(
     get_commitment(conn, id)
 }
 
+pub fn add_commitment_steps(conn: &Connection, id: i64, steps: &[String]) -> AppResult<Commitment> {
+    let mut commitment = actionable_commitment(conn, id)?;
+    if steps.is_empty() {
+        return Err(AppError::invalid("Add at least one action step."));
+    }
+    let prepared = validated_step_titles(steps)?;
+    if commitment.steps.len() + prepared.len() > MAX_COMMITMENT_STEPS {
+        return Err(AppError::invalid(format!(
+            "A commitment can have at most {MAX_COMMITMENT_STEPS} action steps."
+        )));
+    }
+    let mut seen = commitment
+        .steps
+        .iter()
+        .map(|step| step.title.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+    for title in prepared {
+        if !seen.insert(title.to_lowercase()) {
+            return Err(AppError::invalid(format!(
+                "This commitment already has an action step named \"{title}\"."
+            )));
+        }
+        commitment.steps.push(CommitmentStep { title, completed: false });
+    }
+    conn.execute(
+        "UPDATE daily_commitments SET steps=?1 WHERE id=?2",
+        params![serde_json::to_string(&commitment.steps)?, id],
+    )?;
+    get_commitment(conn, id)
+}
+
 pub fn end_day(conn: &Connection, plan_id: i64) -> AppResult<()> {
     conn.execute(
         "UPDATE daily_plans SET ended_at=?1 WHERE id=?2 AND ended_at IS NULL",
@@ -745,6 +783,36 @@ mod tests {
         assert!(updated.steps[0].completed);
         assert!(!updated.steps[1].completed);
         assert!(set_commitment_step_completed(&conn, commitment.id, 99, true).is_err());
+    }
+
+    #[test]
+    fn action_steps_can_be_added_after_the_day_is_locked() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let (_, commitments) = {
+            let tx = conn.transaction().unwrap();
+            let result = lock_day(&tx, &input(crate::db::today_local(), vec![])).unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        let id = commitments[0].id;
+
+        let updated = add_commitment_steps(
+            &conn,
+            id,
+            &["Open the source file".into(), "Review the draft".into()],
+        )
+        .unwrap();
+        assert_eq!(updated.steps.len(), 2);
+
+        set_commitment_step_completed(&conn, id, 0, true).unwrap();
+        let updated = add_commitment_steps(&conn, id, &["Publish the result".into()]).unwrap();
+        assert_eq!(updated.steps.len(), 3);
+        assert!(updated.steps[0].completed);
+        assert!(!updated.steps[2].completed);
+
+        assert!(add_commitment_steps(&conn, id, &[" review THE draft ".into()]).is_err());
+        assert_eq!(get_commitment(&conn, id).unwrap().steps.len(), 3);
     }
 
     #[test]

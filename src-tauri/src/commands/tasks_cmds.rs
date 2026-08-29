@@ -24,6 +24,15 @@ pub fn create_task(state: State<'_, AppState>, input: TaskInput) -> AppResult<Ta
 }
 
 #[tauri::command]
+pub fn create_task_steps(
+    state: State<'_, AppState>,
+    id: i64,
+    steps: Vec<String>,
+) -> AppResult<Vec<Task>> {
+    state.db.with_tx(|tx| tasks::create_steps(tx, id, &steps))
+}
+
+#[tauri::command]
 pub fn update_task(state: State<'_, AppState>, id: i64, input: TaskInput) -> AppResult<Task> {
     state.db.with(|conn| tasks::update(conn, id, &input))
 }

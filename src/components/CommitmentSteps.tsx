@@ -1,26 +1,79 @@
 import { useState } from "react";
 
+import { BreakdownEditor } from "@/components/BreakdownEditor";
 import { api, errorMessage, type Commitment } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 
-export function CommitmentSteps({ commitment }: { commitment: Commitment }) {
+export function CommitmentSteps({
+  commitment,
+  initiallyBreakingDown = false,
+}: {
+  commitment: Commitment;
+  initiallyBreakingDown?: boolean;
+}) {
   const { refreshSnapshot } = useStore();
   const [busyIndex, setBusyIndex] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [breakingDown, setBreakingDown] = useState(initiallyBreakingDown);
   const terminal = ["completed", "deferred", "dropped", "cancelled"].includes(
     commitment.status,
   );
 
-  if (commitment.steps.length === 0) return null;
+  const editor = breakingDown ? (
+    <BreakdownEditor
+      goal={commitment.title}
+      existingSteps={commitment.steps.map((step) => step.title)}
+      onClose={() => setBreakingDown(false)}
+      onSave={async (steps) => {
+        await api.addCommitmentSteps(commitment.id, steps);
+        await refreshSnapshot();
+        setBreakingDown(false);
+      }}
+    />
+  ) : null;
+
+  if (commitment.steps.length === 0) {
+    if (terminal) return null;
+    return (
+      <div className="mt-3">
+        {!breakingDown && (
+          <>
+            <button
+              className="btn border-accent/40 text-accent"
+              aria-expanded={false}
+              onClick={() => setBreakingDown(true)}
+            >
+              Break into steps
+            </button>
+            <span className="ml-2 text-2xs text-ink-500">
+              Turn this outcome into a checkable action list.
+            </span>
+          </>
+        )}
+        {editor}
+      </div>
+    );
+  }
 
   const completed = commitment.steps.filter((step) => step.completed).length;
   return (
     <div className="mt-3 rounded-md border border-ink-700 bg-ink-850 p-3">
       <div className="mb-2 flex items-center justify-between">
         <p className="section-title">Action steps</p>
-        <p className="text-2xs text-ink-500">
-          {completed}/{commitment.steps.length} complete
-        </p>
+        <div className="flex items-center gap-2">
+          <p className="text-2xs text-ink-500">
+            {completed}/{commitment.steps.length} complete
+          </p>
+          {!terminal && commitment.steps.length < 12 && (
+            <button
+              className="text-2xs text-accent hover:underline"
+              aria-expanded={breakingDown}
+              onClick={() => setBreakingDown((open) => !open)}
+            >
+              {breakingDown ? "Close" : "Add steps"}
+            </button>
+          )}
+        </div>
       </div>
       <ol className="space-y-1.5">
         {commitment.steps.map((step, index) => (
@@ -57,6 +110,7 @@ export function CommitmentSteps({ commitment }: { commitment: Commitment }) {
         ))}
       </ol>
       {error && <p className="mt-2 text-2xs text-distracted">{error}</p>}
+      {editor}
     </div>
   );
 }

@@ -183,3 +183,22 @@ pub fn set_commitment_step_completed(
         plans::set_commitment_step_completed(conn, commitment_id, step_index, completed)
     })
 }
+
+#[tauri::command]
+pub fn add_commitment_steps(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    commitment_id: i64,
+    steps: Vec<String>,
+) -> AppResult<Commitment> {
+    let commitment = state
+        .db
+        .with(|conn| plans::add_commitment_steps(conn, commitment_id, &steps))?;
+    emit_event(
+        &app,
+        &AppEvent::CommitmentChanged {
+            commitment_id: Some(commitment_id),
+        },
+    );
+    Ok(commitment)
+}
