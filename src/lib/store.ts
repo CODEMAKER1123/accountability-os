@@ -9,7 +9,13 @@ export type View = "today" | "tasks" | "plan" | "activity" | "scorecard" | "sett
 export type Modal =
   | { kind: "interview"; mode?: "new" | "edit" }
   | { kind: "review" }
-  | { kind: "switch"; fromCommitmentId: number | null; toCommitmentId?: number | null }
+  | {
+      kind: "switch";
+      fromCommitmentId: number | null;
+      toCommitmentId?: number | null;
+      toTaskId?: number | null;
+      toTaskTitle?: string;
+    }
   | { kind: "blocked"; commitmentId: number }
   | { kind: "break" }
   | { kind: "onboarding" }

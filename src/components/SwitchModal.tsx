@@ -16,13 +16,18 @@ const DISPOSITIONS: [string, string][] = [
 export default function SwitchModal({
   fromCommitmentId,
   toCommitmentId = null,
+  toTaskId = null,
+  toTaskTitle,
 }: {
   fromCommitmentId: number | null;
   toCommitmentId?: number | null;
+  toTaskId?: number | null;
+  toTaskTitle?: string;
 }) {
   const { setModal, refreshSnapshot, snapshot } = useStore();
   const [reason, setReason] = useState("");
   const [toId, setToId] = useState<number | null>(toCommitmentId);
+  const [targetTaskId, setTargetTaskId] = useState<number | null>(toTaskId);
   const [disposition, setDisposition] = useState("still_today");
   const [error, setError] = useState<string | null>(null);
 
@@ -47,7 +52,8 @@ export default function SwitchModal({
   const submit = async () => {
     try {
       await api.switchCommitment({
-        to_commitment_id: toId,
+        to_commitment_id: targetTaskId == null ? toId : null,
+        to_task_id: targetTaskId,
         from_commitment_id: fromCommitmentId,
         reason,
         original_disposition: disposition,
@@ -76,6 +82,27 @@ export default function SwitchModal({
 
         <label className="label mt-3">What are you working on instead?</label>
         <div className="space-y-1">
+          {toTaskId != null && (
+            <label
+              className={`flex cursor-pointer items-center gap-2 rounded-md border px-3 py-1.5 text-[13px] ${
+                targetTaskId === toTaskId
+                  ? "border-accent/50 bg-accent/5 text-ink-50"
+                  : "border-ink-700 text-ink-200"
+              }`}
+            >
+              <input
+                type="radio"
+                name="to"
+                className="accent-[#5b8def]"
+                checked={targetTaskId === toTaskId}
+                onChange={() => {
+                  setTargetTaskId(toTaskId);
+                  setToId(null);
+                }}
+              />
+              {toTaskTitle ?? "Selected task"}
+            </label>
+          )}
           {options.map((c) => (
             <label
               key={c.id}
@@ -83,16 +110,36 @@ export default function SwitchModal({
                 toId === c.id ? "border-accent/50 bg-accent/5 text-ink-50" : "border-ink-700 text-ink-200"
               }`}
             >
-              <input type="radio" name="to" className="accent-[#5b8def]" checked={toId === c.id} onChange={() => setToId(c.id)} />
+              <input
+                type="radio"
+                name="to"
+                className="accent-[#5b8def]"
+                checked={targetTaskId == null && toId === c.id}
+                onChange={() => {
+                  setTargetTaskId(null);
+                  setToId(c.id);
+                }}
+              />
               {c.title}
             </label>
           ))}
           <label
             className={`flex cursor-pointer items-center gap-2 rounded-md border px-3 py-1.5 text-[13px] ${
-              toId === null ? "border-accent/50 bg-accent/5 text-ink-50" : "border-ink-700 text-ink-200"
+              targetTaskId == null && toId === null
+                ? "border-accent/50 bg-accent/5 text-ink-50"
+                : "border-ink-700 text-ink-200"
             }`}
           >
-            <input type="radio" name="to" className="accent-[#5b8def]" checked={toId === null} onChange={() => setToId(null)} />
+            <input
+              type="radio"
+              name="to"
+              className="accent-[#5b8def]"
+              checked={targetTaskId == null && toId === null}
+              onChange={() => {
+                setTargetTaskId(null);
+                setToId(null);
+              }}
+            />
             Something off-plan (pause the contract)
           </label>
         </div>

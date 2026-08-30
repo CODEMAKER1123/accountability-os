@@ -68,10 +68,14 @@ export default function Tasks() {
   );
   const todayCommitmentByTask = new Map<number, Commitment>();
   for (const commitment of snapshot?.commitments ?? []) {
-    if (
-      commitment.task_id != null &&
-      !["completed", "deferred", "dropped", "cancelled"].includes(commitment.status)
-    ) {
+    if (commitment.task_id == null) continue;
+    const current = todayCommitmentByTask.get(commitment.task_id);
+    const currentIsClosed =
+      current != null && ["completed", "deferred", "dropped", "cancelled"].includes(current.status);
+    const nextIsOpen = !["completed", "deferred", "dropped", "cancelled"].includes(
+      commitment.status,
+    );
+    if (current == null || (currentIsClosed && nextIsOpen)) {
       todayCommitmentByTask.set(commitment.task_id, commitment);
     }
   }
@@ -90,30 +94,36 @@ export default function Tasks() {
     setStartingTaskId(task.id);
     setError(null);
     try {
-      const commitment = existingCommitment ?? (await api.prepareTaskForToday(task.id));
-      if (!existingCommitment) {
-        await Promise.all([reload(), refreshSnapshot()]);
+      if (
+        existingCommitment &&
+        ["completed", "deferred", "dropped", "cancelled"].includes(existingCommitment.status)
+      ) {
+        throw new Error("That task is already closed in today's accountability record.");
       }
 
-      // Re-read the store after preparing an unplanned task. Another window
-      // may also have changed focus since this row was rendered.
-      const latest = useStore.getState().snapshot;
-      const latestActiveId = latest?.active_commitment?.id ?? null;
-      const latestPausedId =
-        latestActiveId == null
-          ? latest?.commitments.find((item) => item.status === "active")?.id ?? null
+      const beforePrepare = useStore.getState().snapshot;
+      const beforeActiveId = beforePrepare?.active_commitment?.id ?? null;
+      const beforePausedId =
+        beforeActiveId == null
+          ? beforePrepare?.commitments.find((item) => item.status === "active")?.id ?? null
           : null;
-      const latestContractId = latestActiveId ?? latestPausedId;
-      if (latestContractId != null && latestContractId !== commitment.id) {
+      const beforeContractId = beforeActiveId ?? beforePausedId;
+      if (beforeContractId != null && existingCommitment?.id !== beforeContractId) {
         setModal({
           kind: "switch",
-          fromCommitmentId: latestContractId,
-          toCommitmentId: commitment.id,
+          fromCommitmentId: beforeContractId,
+          toCommitmentId: existingCommitment?.id ?? null,
+          toTaskId: existingCommitment == null ? task.id : null,
+          toTaskTitle: existingCommitment == null ? task.title : undefined,
         });
         return;
       }
 
-      await api.startCommitment(commitment.id);
+      if (existingCommitment) {
+        await api.startCommitment(existingCommitment.id);
+      } else {
+        await api.startTask(task.id);
+      }
       await Promise.all([reload(), refreshSnapshot()]);
     } catch (caught) {
       setError(errorMessage(caught));
@@ -398,6 +408,9 @@ function TaskRow({
   const project = projects.find((p) => p.id === task.project_id);
   const done = task.status === "completed";
   const terminal = done || task.status === "cancelled";
+  const closedToday =
+    todayCommitment != null &&
+    ["completed", "deferred", "dropped", "cancelled"].includes(todayCommitment.status);
   const focusActive = todayCommitment?.id === activeCommitmentId;
   const focusPaused = todayCommitment?.id === pausedCommitmentId;
   const requiresSwitch = currentContractId != null && todayCommitment?.id !== currentContractId;
@@ -432,6 +445,7 @@ function TaskRow({
           </span>
           <span className="text-2xs text-ink-500">
             {task.status}
+            {closedToday && ` · ${todayCommitment.status} today`}
             {project && ` · ${project.name}`}
             {task.due_date && ` · due ${task.due_date}`}
             {task.estimated_minutes != null && ` · ~${task.estimated_minutes}m`}
@@ -439,7 +453,7 @@ function TaskRow({
             {childTasks.length > 0 && ` · ${completedSteps}/${childTasks.length} steps`}
           </span>
         </button>
-        {!terminal &&
+        {!terminal && !closedToday &&
           (focusActive ? (
             <span className="shrink-0 text-xs font-medium text-focus">Active</span>
           ) : (

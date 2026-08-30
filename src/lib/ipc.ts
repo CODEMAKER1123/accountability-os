@@ -489,8 +489,7 @@ export const api = {
     ),
   commitmentLimitCheck: (selected: number) =>
     invoke<string | null>("commitment_limit_check", { selected }),
-  prepareTaskForToday: (taskId: number) =>
-    invoke<Commitment>("prepare_task_for_today", { taskId }),
+  startTask: (taskId: number) => invoke<Commitment>("start_task", { taskId }),
   setCommitmentStepCompleted: (commitmentId: number, stepIndex: number, completed: boolean) =>
     invoke<Commitment>("set_commitment_step_completed", {
       commitmentId,
@@ -514,6 +513,7 @@ export const api = {
   }) => invoke<number | null>("block_commitment", { input }),
   switchCommitment: (input: {
     to_commitment_id: number | null;
+    to_task_id?: number | null;
     from_commitment_id: number | null;
     reason: string;
     original_disposition?: string;

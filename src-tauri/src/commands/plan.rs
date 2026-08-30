@@ -172,36 +172,6 @@ pub fn commitment_limit_check(selected: usize) -> Option<String> {
     aos_core::accountability::too_many_commitments_message(selected)
 }
 
-/// Put an open backlog task into today's accountability contract so the
-/// Tasks page can start it through the same focus workflow as Today.
-#[tauri::command]
-pub fn prepare_task_for_today(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    task_id: i64,
-) -> AppResult<Commitment> {
-    let (commitment, newly_locked_plan_id) = state
-        .db
-        .with_tx(|tx| plans::prepare_task_for_today(tx, task_id))?;
-    if let Some(plan_id) = newly_locked_plan_id {
-        let mut engine = state.engine.lock();
-        engine.checkin.last_at = now();
-        engine.interview_snoozes = 0;
-        engine.interview_snoozed_until = None;
-        drop(engine);
-        emit_event(&app, &AppEvent::DayLocked { plan_id });
-    } else {
-        emit_event(
-            &app,
-            &AppEvent::CommitmentChanged {
-                commitment_id: Some(commitment.id),
-            },
-        );
-    }
-    crate::tray::refresh(&app);
-    Ok(commitment)
-}
-
 #[tauri::command]
 pub fn set_commitment_step_completed(
     state: State<'_, AppState>,

@@ -79,6 +79,35 @@ fn current_contract(
     Ok((focus, current_id))
 }
 
+fn ensure_task_start_without_switch_allowed(
+    conn: &rusqlite::Connection,
+    task_id: i64,
+) -> AppResult<()> {
+    plans::validate_task_for_today(conn, task_id)?;
+    let (_, current_id) = current_contract(conn)?;
+    if current_id.is_some() {
+        return Err(AppError::invalid(
+            "Use Switch priority and explain what changed before starting another task.",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_and_start_task(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+) -> AppResult<(Commitment, i64, ActiveCommitment, Option<i64>)> {
+    // This check must happen before preparation so a stale task-list snapshot
+    // cannot reserve one of today's three slots when another focus has begun.
+    ensure_task_start_without_switch_allowed(tx, task_id)?;
+    let (commitment, newly_locked_plan_id) = plans::prepare_task_for_today(tx, task_id)?;
+    ensure_direct_start_allowed(tx, commitment.id)?;
+    let commitment = plans::activate_commitment(tx, commitment.id)?;
+    let focus = engine_data::start_focus(tx, commitment.id)?;
+    let active = load_active(tx, &commitment)?;
+    Ok((commitment, focus.id, active, newly_locked_plan_id))
+}
+
 /// Start (or resume) working on a commitment: opens a focus session and
 /// makes it the active commitment.
 #[tauri::command]
@@ -110,6 +139,54 @@ pub fn start_commitment(
     drop(history_guard);
     emit_event(&app, &AppEvent::FocusStarted { commitment_id });
     emit_event(&app, &AppEvent::CommitmentChanged { commitment_id: Some(commitment_id) });
+    crate::tray::refresh(&app);
+    Ok(commitment)
+}
+
+/// Prepare an unplanned backlog task and start it as one atomic operation.
+/// Task-list callers use this instead of committing a Today slot first and
+/// starting focus in a second command.
+#[tauri::command]
+pub fn start_task(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> AppResult<Commitment> {
+    let history_guard = state.activity_history_boundary.lock();
+    state
+        .db
+        .with(|conn| ensure_task_start_without_switch_allowed(conn, task_id))?;
+    crate::engine::flush_open_session(&app);
+    let (commitment, focus_id, active, newly_locked_plan_id) = state
+        .db
+        .with_tx(|tx| prepare_and_start_task(tx, task_id))?;
+    {
+        let mut engine = state.engine.lock();
+        engine.active_commitment = Some(active);
+        engine.focus_session_id = Some(focus_id);
+        if newly_locked_plan_id.is_some() {
+            engine.checkin.last_at = crate::db::now();
+            engine.interview_snoozes = 0;
+            engine.interview_snoozed_until = None;
+        }
+        engine.tracker.resolve();
+    }
+    drop(history_guard);
+    if let Some(plan_id) = newly_locked_plan_id {
+        emit_event(&app, &AppEvent::DayLocked { plan_id });
+    }
+    emit_event(
+        &app,
+        &AppEvent::FocusStarted {
+            commitment_id: commitment.id,
+        },
+    );
+    emit_event(
+        &app,
+        &AppEvent::CommitmentChanged {
+            commitment_id: Some(commitment.id),
+        },
+    );
     crate::tray::refresh(&app);
     Ok(commitment)
 }
@@ -283,6 +360,9 @@ pub fn block_commitment(
 pub struct SwitchInput {
     /// Commitment being switched TO. None = ad-hoc pause of the plan.
     pub to_commitment_id: Option<i64>,
+    /// Backlog task being switched TO. The command prepares it and switches in
+    /// one transaction so a stale source cannot consume a daily outcome slot.
+    pub to_task_id: Option<i64>,
     pub from_commitment_id: Option<i64>,
     /// "What changed?" — required (spec §7, §15).
     pub reason: String,
@@ -310,8 +390,15 @@ pub fn switch_commitment(
         "cancel" => "cancelled",
         other => return Err(AppError::invalid(format!("Invalid disposition: {other}"))),
     };
+    if input.to_commitment_id.is_some() && input.to_task_id.is_some() {
+        return Err(AppError::invalid(
+            "Choose either a commitment or a backlog task to switch to, not both.",
+        ));
+    }
     if input.to_commitment_id.is_some() && input.to_commitment_id == input.from_commitment_id {
-        return Err(AppError::invalid("Choose a different commitment to switch to."));
+        return Err(AppError::invalid(
+            "Choose a different commitment to switch to.",
+        ));
     }
     let history_guard = state.activity_history_boundary.lock();
 
@@ -320,6 +407,14 @@ pub fn switch_commitment(
     state.db.with(|conn| {
         if let Some(to_id) = input.to_commitment_id {
             plans::actionable_commitment(conn, to_id)?;
+        }
+        if let Some(task_id) = input.to_task_id {
+            plans::validate_task_for_today(conn, task_id)?;
+            if let Some(from_id) = input.from_commitment_id {
+                if plans::get_commitment(conn, from_id)?.task_id == Some(task_id) {
+                    return Err(AppError::invalid("Choose a different task to switch to."));
+                }
+            }
         }
         let (_, current_id) = current_contract(conn)?;
         if current_id != input.from_commitment_id {
@@ -331,64 +426,111 @@ pub fn switch_commitment(
     })?;
 
     crate::engine::flush_open_session(&app);
-    let (new_commitment, new_focus_id, new_active) = state.db.with_tx(|tx| {
-        if let Some(to_id) = input.to_commitment_id {
-            plans::actionable_commitment(tx, to_id)?;
-        }
-        let (current_focus, current_id) = current_contract(tx)?;
-        if current_id != input.from_commitment_id {
-            return Err(AppError::invalid(
-                "The commitment being switched is no longer the active focus.",
-            ));
-        }
-        let ts = crate::db::now();
-        tx.execute(
-            "INSERT INTO interruptions(kind, commitment_id, response, response_note, started_at, acknowledged_at, created_at)
-             VALUES('priority_switch', ?1, 'priority_changed', ?2, ?3, ?3, ?3)",
-            rusqlite::params![input.from_commitment_id, input.reason.trim(), ts],
-        )?;
-        if let Some(from_id) = input.from_commitment_id {
-            plans::set_commitment_status(
-                tx,
-                from_id,
-                from_status,
-                Some("priorities_changed"),
-                Some(input.reason.trim()),
+    let (new_commitment, new_focus_id, new_active, target_id, newly_locked_plan_id) =
+        state.db.with_tx(|tx| {
+            let (current_focus, current_id) = current_contract(tx)?;
+            if current_id != input.from_commitment_id {
+                return Err(AppError::invalid(
+                    "The commitment being switched is no longer the active focus.",
+                ));
+            }
+            let (target_id, newly_locked_plan_id) =
+                match (input.to_commitment_id, input.to_task_id) {
+                    (Some(to_id), None) => {
+                        plans::actionable_commitment(tx, to_id)?;
+                        (Some(to_id), None)
+                    }
+                    (None, Some(task_id)) => {
+                        let (commitment, locked_plan_id) =
+                            plans::prepare_task_for_today(tx, task_id)?;
+                        (Some(commitment.id), locked_plan_id)
+                    }
+                    (None, None) => (None, None),
+                    (Some(_), Some(_)) => {
+                        unreachable!("target exclusivity validated before transaction")
+                    }
+                };
+            if target_id.is_some() && target_id == input.from_commitment_id {
+                return Err(AppError::invalid(
+                    "Choose a different commitment to switch to.",
+                ));
+            }
+            let ts = crate::db::now();
+            tx.execute(
+                "INSERT INTO interruptions(kind, commitment_id, response, response_note, started_at, acknowledged_at, created_at)
+                 VALUES('priority_switch', ?1, 'priority_changed', ?2, ?3, ?3, ?3)",
+                rusqlite::params![input.from_commitment_id, input.reason.trim(), ts],
             )?;
-        }
-        match input.to_commitment_id {
-            Some(to_id) => {
-                let commitment = plans::activate_commitment(tx, to_id)?;
-                let focus = engine_data::start_focus(tx, to_id)?;
-                let active = load_active(tx, &commitment)?;
-                Ok((Some(commitment), Some(focus.id), Some(active)))
+            if let Some(from_id) = input.from_commitment_id {
+                plans::set_commitment_status(
+                    tx,
+                    from_id,
+                    from_status,
+                    Some("priorities_changed"),
+                    Some(input.reason.trim()),
+                )?;
             }
-            None => {
-                if let Some(focus) = current_focus {
-                    engine_data::end_focus_for_commitment(tx, focus.commitment_id, "switched")?;
+            match target_id {
+                Some(to_id) => {
+                    let commitment = plans::activate_commitment(tx, to_id)?;
+                    let focus = engine_data::start_focus(tx, to_id)?;
+                    let active = load_active(tx, &commitment)?;
+                    Ok((
+                        Some(commitment),
+                        Some(focus.id),
+                        Some(active),
+                        Some(to_id),
+                        newly_locked_plan_id,
+                    ))
                 }
-                Ok((None, None, None))
+                None => {
+                    if let Some(focus) = current_focus {
+                        engine_data::end_focus_for_commitment(
+                            tx,
+                            focus.commitment_id,
+                            "switched",
+                        )?;
+                    }
+                    Ok((None, None, None, None, newly_locked_plan_id))
+                }
             }
-        }
-    })?;
+        })?;
 
     {
         let mut engine = state.engine.lock();
         engine.active_commitment = new_active;
         engine.focus_session_id = new_focus_id;
+        if newly_locked_plan_id.is_some() {
+            engine.checkin.last_at = crate::db::now();
+            engine.interview_snoozes = 0;
+            engine.interview_snoozed_until = None;
+        }
         engine.tracker.resolve();
     }
     drop(history_guard);
     if let Some(old_id) = input.from_commitment_id {
-        emit_event(&app, &AppEvent::FocusEnded { commitment_id: old_id });
+        emit_event(
+            &app,
+            &AppEvent::FocusEnded {
+                commitment_id: old_id,
+            },
+        );
     }
-    if let Some(new_id) = input.to_commitment_id {
-        emit_event(&app, &AppEvent::FocusStarted { commitment_id: new_id });
+    if let Some(plan_id) = newly_locked_plan_id {
+        emit_event(&app, &AppEvent::DayLocked { plan_id });
+    }
+    if let Some(new_id) = target_id {
+        emit_event(
+            &app,
+            &AppEvent::FocusStarted {
+                commitment_id: new_id,
+            },
+        );
     }
     emit_event(
         &app,
         &AppEvent::CommitmentChanged {
-            commitment_id: input.to_commitment_id,
+            commitment_id: target_id,
         },
     );
     crate::tray::refresh(&app);
@@ -399,6 +541,24 @@ pub fn switch_commitment(
 mod tests {
     use super::*;
     use aos_core::types::Classification;
+
+    fn backlog_task(conn: &rusqlite::Connection, title: &str) -> crate::db::models::Task {
+        tasks::create(
+            conn,
+            &tasks::TaskInput {
+                title: title.into(),
+                description: format!("{title} has a reviewed, verifiable result."),
+                project_id: None,
+                parent_task_id: None,
+                status: "inbox".into(),
+                priority: "must".into(),
+                estimated_minutes: Some(30),
+                due_date: None,
+                tags: vec![],
+            },
+        )
+        .unwrap()
+    }
 
     #[test]
     fn clearing_another_commitment_preserves_the_live_distraction_episode() {
@@ -424,5 +584,36 @@ mod tests {
         assert!(engine.active_commitment.is_none());
         assert!(engine.focus_session_id.is_none());
         assert!(engine.tracker.episode_started_at().is_none());
+    }
+
+    #[test]
+    fn atomic_task_start_rejects_stale_empty_focus_without_consuming_a_slot() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let source = backlog_task(&conn, "Current focus");
+        let target = backlog_task(&conn, "Stale widget target");
+        let source_commitment = {
+            let tx = conn.transaction().unwrap();
+            let commitment = plans::prepare_task_for_today(&tx, source.id).unwrap().0;
+            plans::activate_commitment(&tx, commitment.id).unwrap();
+            engine_data::start_focus(&tx, commitment.id).unwrap();
+            tx.commit().unwrap();
+            commitment
+        };
+
+        let tx = conn.transaction().unwrap();
+        let error = prepare_and_start_task(&tx, target.id)
+            .unwrap_err()
+            .to_string();
+        drop(tx);
+
+        assert!(error.contains("Switch priority"), "{error}");
+        assert_eq!(
+            plans::list_commitments(&conn, source_commitment.plan_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(tasks::get(&conn, target.id).unwrap().status, "inbox");
     }
 }
