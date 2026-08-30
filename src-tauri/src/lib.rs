@@ -44,7 +44,21 @@ pub fn run() {
 
             // Database in the per-user app data directory (spec §3: local-first).
             let data_dir = handle.path().app_data_dir()?;
-            let db = db::Db::open(&data_dir.join("accountability.sqlite3"))
+            let db_path = data_dir.join("accountability.sqlite3");
+            match db::recovery::recover_codex_virtualized_database(&db_path) {
+                Ok(Some(report)) => log::info!(
+                    target: "recovery",
+                    "restored database from {}; preserved {} newer activity sessions; rollback snapshot removed",
+                    report.source.display(),
+                    report.imported_activity_sessions
+                ),
+                Ok(None) => {}
+                Err(error) => log::error!(
+                    target: "recovery",
+                    "legacy database recovery did not complete: {error}"
+                ),
+            }
+            let db = db::Db::open(&db_path)
                 .map_err(|e| format!("failed to open database: {e}"))?;
             let settings = db
                 .with(db::settings::load)
