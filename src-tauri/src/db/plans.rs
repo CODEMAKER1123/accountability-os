@@ -1,11 +1,11 @@
 //! Daily plans + commitments (spec §5–7, §15).
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-use super::models::{Commitment, CommitmentStep, DailyPlan};
-use super::now;
+use super::models::{Commitment, CommitmentStep, DailyPlan, Task};
+use super::{now, tasks};
 use crate::error::{AppError, AppResult};
 use aos_core::accountability::{too_many_commitments_message, MAX_COMMITMENTS};
 
@@ -171,6 +171,161 @@ fn validated_step_titles(steps: &[String]) -> AppResult<Vec<String>> {
         }
     }
     Ok(validated)
+}
+
+fn quick_start_done_definition(task: &Task) -> String {
+    let description = task.description.trim();
+    if description.chars().count() >= 10 {
+        description.chars().take(2_000).collect()
+    } else {
+        format!(
+            "{} is finished and the result is ready to verify.",
+            task.title.trim()
+        )
+    }
+}
+
+/// Ensure an open backlog task has an actionable commitment in today's plan.
+///
+/// Starting work from the Tasks page is explicit planning intent. If the user
+/// has not planned today yet, create a minimal locked plan containing this one
+/// task. If a plan is already open, append the task without disturbing the
+/// existing contract. The three-outcome limit and closed/day-off boundaries
+/// still apply.
+pub fn prepare_task_for_today(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+) -> AppResult<(Commitment, Option<i64>)> {
+    let task = tasks::get(tx, task_id)?;
+    if matches!(task.status.as_str(), "completed" | "cancelled") {
+        return Err(AppError::invalid(
+            "Completed or cancelled tasks cannot be started.",
+        ));
+    }
+
+    let date = super::today_local();
+    let ts = now();
+    let (plan_id, newly_locked_plan_id) = match get_plan_by_date(tx, &date)? {
+        Some(plan) => {
+            if plan.is_day_off {
+                return Err(AppError::invalid(
+                    "Today is marked off. Reopen the day before starting a task.",
+                ));
+            }
+            if plan.ended_at.is_some() {
+                return Err(AppError::invalid(
+                    "Today's review is complete. Start this task on a new day.",
+                ));
+            }
+            if plan.locked_at.is_none() {
+                tx.execute(
+                    "UPDATE daily_plans SET locked_at=?1, most_important_when='now' WHERE id=?2",
+                    params![ts, plan.id],
+                )?;
+                (plan.id, Some(plan.id))
+            } else {
+                (plan.id, None)
+            }
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO daily_plans(
+                    date, locked_at, likely_distraction, countermeasure,
+                    most_important_when, interview_answers, is_day_off, created_at
+                 ) VALUES(?1,?2,'','','now',?3,0,?2)",
+                params![
+                    date,
+                    ts,
+                    serde_json::to_string(&serde_json::json!({
+                        "source": "task_list_quick_start"
+                    }))?
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            (id, Some(id))
+        }
+    };
+
+    let existing = tx
+        .query_row(
+            "SELECT * FROM daily_commitments
+             WHERE plan_id=?1 AND task_id=?2
+             ORDER BY id LIMIT 1",
+            params![plan_id, task_id],
+            commitment_from_row,
+        )
+        .optional()?;
+    if let Some(commitment) = existing {
+        if matches!(
+            commitment.status.as_str(),
+            "completed" | "deferred" | "dropped" | "cancelled"
+        ) {
+            return Err(AppError::invalid(
+                "That task is already closed in today's accountability record.",
+            ));
+        }
+        tx.execute(
+            "UPDATE tasks SET status='committed', completed_at=NULL WHERE id=?1",
+            [task_id],
+        )?;
+        return Ok((commitment, newly_locked_plan_id));
+    }
+
+    let commitment_count: usize = tx.query_row(
+        "SELECT COUNT(*) FROM daily_commitments WHERE plan_id=?1",
+        [plan_id],
+        |row| row.get(0),
+    )?;
+    if let Some(message) = too_many_commitments_message(commitment_count + 1) {
+        return Err(AppError::Invalid(format!(
+            "{message} Edit today's plan before starting another task."
+        )));
+    }
+
+    let rank: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(rank), 0) + 1 FROM daily_commitments WHERE plan_id=?1",
+        [plan_id],
+        |row| row.get(0),
+    )?;
+    let steps = {
+        let mut stmt = tx.prepare(
+            "SELECT title, status FROM tasks
+             WHERE parent_task_id=?1
+             ORDER BY CASE priority WHEN 'must' THEN 0 WHEN 'should' THEN 1 ELSE 2 END,
+                      created_at, id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![task_id, MAX_COMMITMENT_STEPS as i64], |row| {
+            Ok(CommitmentStep {
+                title: row.get(0)?,
+                completed: row.get::<_, String>(1)? == "completed",
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "INSERT INTO daily_commitments(
+            plan_id, task_id, title, done_definition, estimated_minutes,
+            priority, rank, status, created_at, steps
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9)",
+        params![
+            plan_id,
+            task.id,
+            task.title.trim(),
+            quick_start_done_definition(&task),
+            task.estimated_minutes,
+            task.priority,
+            rank,
+            ts,
+            serde_json::to_string(&steps)?
+        ],
+    )?;
+    let commitment = get_commitment(tx, tx.last_insert_rowid())?;
+    tx.execute(
+        "UPDATE tasks SET status='committed', completed_at=NULL WHERE id=?1",
+        [task_id],
+    )?;
+    Ok((commitment, newly_locked_plan_id))
 }
 
 fn validate_day_input(input: &LockDayInput) -> AppResult<Vec<Vec<String>>> {
@@ -737,6 +892,24 @@ pub fn end_day(conn: &Connection, plan_id: i64) -> AppResult<()> {
 mod tests {
     use super::*;
 
+    fn backlog_task(conn: &Connection, title: &str) -> Task {
+        tasks::create(
+            conn,
+            &tasks::TaskInput {
+                title: title.into(),
+                description: format!("{title} has a reviewed, verifiable result."),
+                project_id: None,
+                parent_task_id: None,
+                status: "inbox".into(),
+                priority: "must".into(),
+                estimated_minutes: Some(45),
+                due_date: None,
+                tags: vec![],
+            },
+        )
+        .unwrap()
+    }
+
     fn input(date: String, steps: Vec<String>) -> LockDayInput {
         LockDayInput {
             date,
@@ -824,6 +997,122 @@ mod tests {
             .collect();
         let tx = conn.transaction().unwrap();
         assert!(lock_day(&tx, &input(crate::db::today_local(), too_many)).is_err());
+    }
+
+    #[test]
+    fn preparing_a_backlog_task_creates_one_locked_plan_and_preserves_steps() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let task = backlog_task(&conn, "Prepare the client proposal");
+        let children = tasks::create_steps(
+            &conn,
+            task.id,
+            &["Check the scope".into(), "Send the proposal".into()],
+        )
+        .unwrap();
+        tasks::set_status(&conn, children[0].id, "completed").unwrap();
+
+        let (commitment, locked_plan_id) = {
+            let tx = conn.transaction().unwrap();
+            let result = prepare_task_for_today(&tx, task.id).unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        assert_eq!(locked_plan_id, Some(commitment.plan_id));
+        assert_eq!(commitment.task_id, Some(task.id));
+        assert_eq!(commitment.title, task.title);
+        assert_eq!(commitment.done_definition, task.description);
+        assert_eq!(commitment.status, "pending");
+        assert_eq!(commitment.steps.len(), 2);
+        assert!(commitment.steps[0].completed);
+        assert!(!commitment.steps[1].completed);
+        let plan = get_plan(&conn, commitment.plan_id).unwrap();
+        assert_eq!(plan.date, crate::db::today_local());
+        assert!(plan.locked_at.is_some());
+        assert_eq!(tasks::get(&conn, task.id).unwrap().status, "committed");
+
+        let (same_commitment, second_lock) = {
+            let tx = conn.transaction().unwrap();
+            let result = prepare_task_for_today(&tx, task.id).unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        assert_eq!(same_commitment.id, commitment.id);
+        assert_eq!(second_lock, None);
+        assert_eq!(list_commitments(&conn, plan.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn preparing_a_backlog_task_keeps_the_three_outcome_limit() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let tasks_for_today = [
+            backlog_task(&conn, "First outcome"),
+            backlog_task(&conn, "Second outcome"),
+            backlog_task(&conn, "Third outcome"),
+        ];
+        let extra = backlog_task(&conn, "Fourth outcome");
+        let commitments = tasks_for_today
+            .iter()
+            .map(|task| CommitmentInput {
+                task_id: Some(task.id),
+                title: task.title.clone(),
+                done_definition: task.description.clone(),
+                estimated_minutes: task.estimated_minutes,
+                priority: task.priority.clone(),
+                steps: vec![],
+            })
+            .collect();
+        let (_, locked) = {
+            let tx = conn.transaction().unwrap();
+            let result = lock_day(
+                &tx,
+                &LockDayInput {
+                    date: crate::db::today_local(),
+                    commitments,
+                    likely_distraction: String::new(),
+                    countermeasure: String::new(),
+                    most_important_when: "now".into(),
+                    interview_answers: serde_json::Value::Null,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            result
+        };
+        assert_eq!(locked.len(), 3);
+
+        let tx = conn.transaction().unwrap();
+        let error = prepare_task_for_today(&tx, extra.id)
+            .unwrap_err()
+            .to_string();
+        drop(tx);
+        assert!(error.contains("3"), "{error}");
+        assert!(error.contains("Edit today's plan"), "{error}");
+        assert_eq!(tasks::get(&conn, extra.id).unwrap().status, "inbox");
+
+        let tx = conn.transaction().unwrap();
+        let existing = prepare_task_for_today(&tx, tasks_for_today[0].id).unwrap().0;
+        tx.commit().unwrap();
+        assert_eq!(existing.id, locked[0].id);
+    }
+
+    #[test]
+    fn preparing_a_closed_task_is_rejected_without_creating_a_plan() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let task = backlog_task(&conn, "Already finished");
+        tasks::set_status(&conn, task.id, "completed").unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let error = prepare_task_for_today(&tx, task.id)
+            .unwrap_err()
+            .to_string();
+        drop(tx);
+        assert!(error.contains("cannot be started"), "{error}");
+        assert!(get_plan_by_date(&conn, &crate::db::today_local())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
