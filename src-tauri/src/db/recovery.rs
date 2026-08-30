@@ -424,10 +424,63 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
             [],
         )?;
 
-        // Defaults are editable in the UI. Replacing that subset exactly is
-        // what preserves an intentional deletion from the installed app.
+        // Keep the installed app's unlinked pending prompts so engine restore
+        // can reopen them. Defaults are editable in the UI, so replacing that
+        // subset exactly also preserves an intentional deletion.
         tx.execute_batch(
-            "DELETE FROM main.domain_rules WHERE is_default = 1;
+            "INSERT INTO main.checkins (
+                 due_at, shown_at, commitment_id, window_stats, created_at
+             )
+             SELECT current.due_at, current.shown_at, NULL,
+                    current.window_stats, current.created_at
+             FROM current_snapshot.checkins current
+             WHERE current.commitment_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM current_snapshot.checkin_responses response
+                   WHERE response.checkin_id = current.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.checkins legacy
+                   WHERE legacy.due_at = current.due_at
+                     AND legacy.shown_at IS current.shown_at
+                     AND legacy.window_stats = current.window_stats
+                     AND legacy.created_at = current.created_at
+                     AND NOT EXISTS (
+                         SELECT 1 FROM main.checkin_responses response
+                         WHERE response.checkin_id = legacy.id
+                     )
+               );
+
+             INSERT INTO main.interruptions (
+                 kind, commitment_id, app_name, process_name, browser_domain,
+                 window_title, distracted_secs, episode_started_at,
+                 started_at, acknowledged_at, response, response_note,
+                 returned_at, recovery_secs, created_at
+             )
+             SELECT current.kind, NULL, current.app_name, current.process_name,
+                    current.browser_domain, current.window_title,
+                    current.distracted_secs, current.episode_started_at,
+                    current.started_at, current.acknowledged_at,
+                    current.response, current.response_note,
+                    current.returned_at, current.recovery_secs,
+                    current.created_at
+             FROM current_snapshot.interruptions current
+             WHERE current.kind = 'intervention'
+               AND current.commitment_id IS NULL
+               AND current.acknowledged_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.interruptions legacy
+                   WHERE legacy.kind = current.kind
+                     AND legacy.started_at = current.started_at
+                     AND legacy.app_name = current.app_name
+                     AND legacy.process_name = current.process_name
+                     AND COALESCE(legacy.browser_domain, '') =
+                         COALESCE(current.browser_domain, '')
+                     AND legacy.window_title = current.window_title
+                     AND legacy.created_at = current.created_at
+               );
+
+             DELETE FROM main.domain_rules WHERE is_default = 1;
 
              INSERT INTO main.domain_rules (
                 domain, classification, project_id, commitment_id,
@@ -1013,6 +1066,25 @@ mod tests {
                 [],
             )
             .unwrap();
+        target
+            .execute(
+                "INSERT INTO checkins(due_at, shown_at, window_stats, created_at)
+                 VALUES(210, 211, '{}', 210)",
+                [],
+            )
+            .unwrap();
+        target
+            .execute(
+                "INSERT INTO interruptions(
+                     kind, app_name, process_name, window_title,
+                     distracted_secs, episode_started_at, started_at, created_at
+                 ) VALUES(
+                     'intervention', 'Browser', 'browser.exe', 'Pending prompt',
+                     90, 190, 220, 220
+                 )",
+                [],
+            )
+            .unwrap();
         drop(target);
 
         recover_legacy_database(&target_path, &legacy_path)
@@ -1027,8 +1099,29 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
+        let unanswered_checkins: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM checkins current
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM checkin_responses response
+                     WHERE response.checkin_id = current.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let open_interruptions: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM interruptions
+                 WHERE kind='intervention' AND acknowledged_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(tasks, 1);
         assert_eq!(sessions, 1);
+        assert_eq!(unanswered_checkins, 1);
+        assert_eq!(open_interruptions, 1);
     }
 
     #[test]
