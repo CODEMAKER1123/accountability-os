@@ -155,6 +155,8 @@ export default function App() {
         <SwitchModal
           fromCommitmentId={modal.fromCommitmentId}
           toCommitmentId={modal.toCommitmentId ?? null}
+          toTaskId={modal.toTaskId ?? null}
+          toTaskTitle={modal.toTaskTitle}
         />
       )}
       {modal?.kind === "blocked" && <BlockedModal commitmentId={modal.commitmentId} />}

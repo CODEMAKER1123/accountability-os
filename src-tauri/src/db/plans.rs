@@ -185,6 +185,84 @@ fn quick_start_done_definition(task: &Task) -> String {
     }
 }
 
+struct TaskForTodayInspection {
+    task: Task,
+    date: String,
+    plan: Option<DailyPlan>,
+    existing: Option<Commitment>,
+}
+
+fn inspect_task_for_today(conn: &Connection, task_id: i64) -> AppResult<TaskForTodayInspection> {
+    let task = tasks::get(conn, task_id)?;
+    if matches!(task.status.as_str(), "completed" | "cancelled") {
+        return Err(AppError::invalid(
+            "Completed or cancelled tasks cannot be started.",
+        ));
+    }
+
+    let date = super::today_local();
+    let plan = get_plan_by_date(conn, &date)?;
+    let existing = if let Some(plan) = &plan {
+        if plan.is_day_off {
+            return Err(AppError::invalid(
+                "Today is marked off. Reopen the day before starting a task.",
+            ));
+        }
+        if plan.ended_at.is_some() {
+            return Err(AppError::invalid(
+                "Today's review is complete. Start this task on a new day.",
+            ));
+        }
+        let existing = conn
+            .query_row(
+                "SELECT * FROM daily_commitments
+                 WHERE plan_id=?1 AND task_id=?2
+                 ORDER BY id LIMIT 1",
+                params![plan.id, task_id],
+                commitment_from_row,
+            )
+            .optional()?;
+        if let Some(commitment) = &existing {
+            if matches!(
+                commitment.status.as_str(),
+                "completed" | "deferred" | "dropped" | "cancelled"
+            ) {
+                return Err(AppError::invalid(
+                    "That task is already closed in today's accountability record.",
+                ));
+            }
+        } else {
+            let commitment_count: usize = conn.query_row(
+                "SELECT COUNT(*) FROM daily_commitments WHERE plan_id=?1",
+                [plan.id],
+                |row| row.get(0),
+            )?;
+            if let Some(message) = too_many_commitments_message(commitment_count + 1) {
+                return Err(AppError::Invalid(format!(
+                    "{message} Edit today's plan before starting another task."
+                )));
+            }
+        }
+        existing
+    } else {
+        None
+    };
+
+    Ok(TaskForTodayInspection {
+        task,
+        date,
+        plan,
+        existing,
+    })
+}
+
+/// Validate a task-list quick start without changing the plan. Switch flows
+/// use this before ending the current focus session, then repeat the same
+/// checks inside their transaction.
+pub fn validate_task_for_today(conn: &Connection, task_id: i64) -> AppResult<()> {
+    inspect_task_for_today(conn, task_id).map(|_| ())
+}
+
 /// Ensure an open backlog task has an actionable commitment in today's plan.
 ///
 /// Starting work from the Tasks page is explicit planning intent. If the user
@@ -196,27 +274,11 @@ pub fn prepare_task_for_today(
     tx: &rusqlite::Transaction<'_>,
     task_id: i64,
 ) -> AppResult<(Commitment, Option<i64>)> {
-    let task = tasks::get(tx, task_id)?;
-    if matches!(task.status.as_str(), "completed" | "cancelled") {
-        return Err(AppError::invalid(
-            "Completed or cancelled tasks cannot be started.",
-        ));
-    }
-
-    let date = super::today_local();
+    let inspected = inspect_task_for_today(tx, task_id)?;
+    let task = inspected.task;
     let ts = now();
-    let (plan_id, newly_locked_plan_id) = match get_plan_by_date(tx, &date)? {
+    let (plan_id, newly_locked_plan_id) = match inspected.plan {
         Some(plan) => {
-            if plan.is_day_off {
-                return Err(AppError::invalid(
-                    "Today is marked off. Reopen the day before starting a task.",
-                ));
-            }
-            if plan.ended_at.is_some() {
-                return Err(AppError::invalid(
-                    "Today's review is complete. Start this task on a new day.",
-                ));
-            }
             if plan.locked_at.is_none() {
                 tx.execute(
                     "UPDATE daily_plans SET locked_at=?1, most_important_when='now' WHERE id=?2",
@@ -234,7 +296,7 @@ pub fn prepare_task_for_today(
                     most_important_when, interview_answers, is_day_off, created_at
                  ) VALUES(?1,?2,'','','now',?3,0,?2)",
                 params![
-                    date,
+                    inspected.date,
                     ts,
                     serde_json::to_string(&serde_json::json!({
                         "source": "task_list_quick_start"
@@ -246,40 +308,12 @@ pub fn prepare_task_for_today(
         }
     };
 
-    let existing = tx
-        .query_row(
-            "SELECT * FROM daily_commitments
-             WHERE plan_id=?1 AND task_id=?2
-             ORDER BY id LIMIT 1",
-            params![plan_id, task_id],
-            commitment_from_row,
-        )
-        .optional()?;
-    if let Some(commitment) = existing {
-        if matches!(
-            commitment.status.as_str(),
-            "completed" | "deferred" | "dropped" | "cancelled"
-        ) {
-            return Err(AppError::invalid(
-                "That task is already closed in today's accountability record.",
-            ));
-        }
+    if let Some(commitment) = inspected.existing {
         tx.execute(
             "UPDATE tasks SET status='committed', completed_at=NULL WHERE id=?1",
             [task_id],
         )?;
         return Ok((commitment, newly_locked_plan_id));
-    }
-
-    let commitment_count: usize = tx.query_row(
-        "SELECT COUNT(*) FROM daily_commitments WHERE plan_id=?1",
-        [plan_id],
-        |row| row.get(0),
-    )?;
-    if let Some(message) = too_many_commitments_message(commitment_count + 1) {
-        return Err(AppError::Invalid(format!(
-            "{message} Edit today's plan before starting another task."
-        )));
     }
 
     let rank: i64 = tx.query_row(
@@ -1113,6 +1147,71 @@ mod tests {
         assert!(get_plan_by_date(&conn, &crate::db::today_local())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn preparing_a_task_closed_in_todays_record_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let task = backlog_task(&conn, "Already deferred today");
+        let commitment = {
+            let tx = conn.transaction().unwrap();
+            let result = prepare_task_for_today(&tx, task.id).unwrap().0;
+            tx.commit().unwrap();
+            result
+        };
+        set_commitment_status(
+            &conn,
+            commitment.id,
+            "deferred",
+            Some("priorities_changed"),
+            Some("Waiting until tomorrow"),
+        )
+        .unwrap();
+
+        let error = validate_task_for_today(&conn, task.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already closed"), "{error}");
+
+        let tx = conn.transaction().unwrap();
+        assert!(prepare_task_for_today(&tx, task.id).is_err());
+        drop(tx);
+        assert_eq!(
+            list_commitments(&conn, commitment.plan_id).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn preparing_a_switch_target_rolls_back_with_its_transaction() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let source = backlog_task(&conn, "Current focus");
+        let target = backlog_task(&conn, "Potential replacement");
+        let source_commitment = {
+            let tx = conn.transaction().unwrap();
+            let result = prepare_task_for_today(&tx, source.id).unwrap().0;
+            tx.commit().unwrap();
+            result
+        };
+
+        let rolled_back_commitment_id = {
+            let tx = conn.transaction().unwrap();
+            let target_commitment = prepare_task_for_today(&tx, target.id).unwrap().0;
+            let id = target_commitment.id;
+            drop(tx);
+            id
+        };
+
+        assert!(get_commitment(&conn, rolled_back_commitment_id).is_err());
+        assert_eq!(
+            list_commitments(&conn, source_commitment.plan_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(tasks::get(&conn, target.id).unwrap().status, "inbox");
     }
 
     #[test]

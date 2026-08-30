@@ -514,6 +514,7 @@ export const api = {
   }) => invoke<number | null>("block_commitment", { input }),
   switchCommitment: (input: {
     to_commitment_id: number | null;
+    to_task_id?: number | null;
     from_commitment_id: number | null;
     reason: string;
     original_disposition?: string;

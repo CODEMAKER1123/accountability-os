@@ -134,10 +134,12 @@ export default function WidgetWindow() {
   const todayCommitmentByTask = useMemo(() => {
     const result = new Map<number, Commitment>();
     for (const commitment of snap?.commitments ?? []) {
-      if (
-        commitment.task_id != null &&
-        !TERMINAL_COMMITMENT_STATUSES.includes(commitment.status)
-      ) {
+      if (commitment.task_id == null) continue;
+      const current = result.get(commitment.task_id);
+      const currentIsClosed =
+        current != null && TERMINAL_COMMITMENT_STATUSES.includes(current.status);
+      const nextIsOpen = !TERMINAL_COMMITMENT_STATUSES.includes(commitment.status);
+      if (current == null || (currentIsClosed && nextIsOpen)) {
         result.set(commitment.task_id, commitment);
       }
     }
@@ -172,6 +174,7 @@ export default function WidgetWindow() {
 
   const startTask = async (task: Task, commitment: Commitment | null) => {
     if (onBreak) return;
+    if (commitment && TERMINAL_COMMITMENT_STATUSES.includes(commitment.status)) return;
     if (currentContractId != null && commitment?.id !== currentContractId) {
       requestSwitch(task.title, task, commitment);
       return;
@@ -197,11 +200,10 @@ export default function WidgetWindow() {
     const switched = await run(
       `switch-${target.task?.id ?? target.commitment?.id ?? "target"}`,
       async () => {
-        const commitment =
-          target.commitment ?? (await api.prepareTaskForToday(target.task!.id));
         await api.switchCommitment({
           from_commitment_id: target.fromCommitmentId,
-          to_commitment_id: commitment.id,
+          to_commitment_id: target.commitment?.id ?? null,
+          to_task_id: target.commitment == null ? target.task!.id : null,
           reason: switchReason.trim(),
           original_disposition: switchDisposition,
         });
@@ -609,10 +611,21 @@ function TaskRow({
   busyLabel: boolean;
   onStart: () => void;
 }) {
-  const terminal = TERMINAL_TASK_STATUSES.includes(task.status);
+  const taskTerminal = TERMINAL_TASK_STATUSES.includes(task.status);
+  const closedToday =
+    commitment != null && TERMINAL_COMMITMENT_STATUSES.includes(commitment.status);
   const active = commitment?.id === activeId;
   const paused = commitment?.id === pausedId;
   const requiresSwitch = currentContractId != null && commitment?.id !== currentContractId;
+  const state = active
+    ? "Active"
+    : paused
+      ? "Paused"
+      : closedToday
+        ? commitment.status === "deferred"
+          ? "Deferred today"
+          : "Closed today"
+        : taskStatusLabel(task);
   return (
     <li
       className="flex items-center gap-2 rounded-md border border-ink-700 bg-ink-900 py-1.5 pr-2.5"
@@ -620,18 +633,18 @@ function TaskRow({
     >
       <div className="min-w-0 flex-1">
         <p
-          className={`line-clamp-2 text-xs ${terminal ? "text-ink-500 line-through" : "text-ink-100"}`}
+          className={`line-clamp-2 text-xs ${taskTerminal ? "text-ink-500 line-through" : "text-ink-100"}`}
           title={task.title}
         >
           {task.title}
         </p>
         <p className="truncate text-2xs text-ink-500">
-          {active ? "Active" : paused ? "Paused" : taskStatusLabel(task)}
+          {state}
           {project ? ` · ${project.name}` : ""}
           {childCount > 0 ? ` · ${childCount} steps` : ""}
         </p>
       </div>
-      {!terminal && !active && (
+      {!taskTerminal && !closedToday && !active && (
         <button
           className="btn shrink-0 py-1 text-2xs"
           disabled={busy || onBreak}
