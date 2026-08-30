@@ -625,6 +625,10 @@ pub fn get_extension_info(state: State<'_, AppState>) -> ExtensionInfo {
 pub fn set_widget_visible(app: tauri::AppHandle, state: State<'_, AppState>, visible: bool) -> AppResult<()> {
     let always_on_top = { state.engine.lock().settings.widget_always_on_top };
     if let Some(w) = app.get_webview_window("widget") {
+        w.set_resizable(true)
+            .map_err(|e| AppError::Internal(format!("widget window: {e}")))?;
+        w.set_min_size(Some(tauri::LogicalSize::new(320.0, 360.0)))
+            .map_err(|e| AppError::Internal(format!("widget window: {e}")))?;
         w.set_always_on_top(always_on_top)
             .map_err(|e| AppError::Internal(format!("widget window: {e}")))?;
         if visible {
@@ -644,7 +648,8 @@ pub fn set_widget_visible(app: tauri::AppHandle, state: State<'_, AppState>, vis
     )
     .title("Focus")
     .inner_size(340.0, 430.0)
-    .resizable(false)
+    .min_inner_size(320.0, 360.0)
+    .resizable(true)
     .decorations(false)
     .always_on_top(always_on_top)
     .skip_taskbar(true)

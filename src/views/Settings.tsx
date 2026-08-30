@@ -276,7 +276,7 @@ export default function Settings() {
         <Toggle label="Start minimized to tray" checked={form.start_minimized} onChange={(v) => patch({ start_minimized: v })} />
         <Toggle
           label="Always-on-top focus widget"
-          hint="Small corner widget with the active commitment and timer."
+          hint="Resizable focus widget with productivity, today's plan, and your full open task list."
           checked={form.widget_enabled}
           onChange={(v) => patch({ widget_enabled: v })}
         />
