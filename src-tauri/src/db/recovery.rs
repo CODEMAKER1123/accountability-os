@@ -139,7 +139,14 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
         // This avoids carrying stale sidecars across the restore boundary.
         let conn = Connection::open(target)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        if recovery_was_completed(&conn)? || !is_fresh_installed_database(&conn)? {
+        if recovery_was_completed(&conn)? {
+            return Ok(None);
+        }
+        if !is_fresh_installed_database(&conn)? {
+            // A populated installed database is authoritative, including when
+            // data was restored manually. Retire the virtualized source now so
+            // deleting current planning rows cannot make it eligible later.
+            record_recovery_completed(&conn, legacy)?;
             return Ok(None);
         }
         checkpoint_wal(&conn)?;
@@ -881,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn populated_target_is_never_overwritten() {
+    fn populated_target_wins_and_retires_the_legacy_source() {
         let dir = tempfile::tempdir().unwrap();
         let legacy_path = dir.path().join("legacy.sqlite3");
         let target_path = dir.path().join(DATABASE_NAME);
@@ -900,11 +907,23 @@ mod tests {
         assert!(recover_legacy_database(&target_path, &legacy_path)
             .unwrap()
             .is_none());
-        let target = Connection::open(target_path).unwrap();
+        let target = Connection::open(&target_path).unwrap();
         let title: String = target
             .query_row("SELECT title FROM tasks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(title, "Current task");
+        assert!(recovery_was_completed(&target).unwrap());
+        target.execute("DELETE FROM tasks", []).unwrap();
+        drop(target);
+
+        assert!(recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .is_none());
+        let reopened = Connection::open(target_path).unwrap();
+        let tasks: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tasks, 0, "the retired legacy source must stay retired");
     }
 
     #[test]
