@@ -13,6 +13,7 @@ use super::{migrations, scores};
 
 const DATABASE_NAME: &str = "accountability.sqlite3";
 const APP_DATA_DIR_NAME: &str = "com.accountability-os.desktop";
+const RECOVERY_MARKER_KEY: &str = "codex_virtualized_database_recovery_v1";
 
 #[derive(Debug, Clone)]
 pub struct RecoveryReport {
@@ -138,7 +139,7 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
         // This avoids carrying stale sidecars across the restore boundary.
         let conn = Connection::open(target)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        if !is_fresh_installed_database(&conn)? {
+        if recovery_was_completed(&conn)? || !is_fresh_installed_database(&conn)? {
             return Ok(None);
         }
         checkpoint_wal(&conn)?;
@@ -186,6 +187,7 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     } else {
         0
     };
+    record_recovery_completed(&consolidated, legacy)?;
     validate_database(&consolidated)?;
 
     drop(target_conn);
@@ -288,6 +290,30 @@ fn is_fresh_installed_database(conn: &Connection) -> AppResult<bool> {
     Ok(true)
 }
 
+fn recovery_was_completed(conn: &Connection) -> AppResult<bool> {
+    if !table_exists(conn, "settings")? {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+        [RECOVERY_MARKER_KEY],
+        |row| row.get(0),
+    )?)
+}
+
+fn record_recovery_completed(conn: &Connection, source: &Path) -> AppResult<()> {
+    let value = serde_json::json!({
+        "completed_at": chrono::Utc::now().to_rfc3339(),
+        "source": source.to_string_lossy(),
+    });
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (RECOVERY_MARKER_KEY, serde_json::to_string(&value)?),
+    )?;
+    Ok(())
+}
+
 fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(
@@ -365,11 +391,18 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
                      AND legacy.is_default = 1
                );
 
-             INSERT OR IGNORE INTO main.classification_cache (
-                cache_key, classification, confidence, reason, created_at
-             )
-             SELECT cache_key, classification, confidence, reason, created_at
-             FROM current_snapshot.classification_cache;",
+             INSERT INTO main.classification_cache (
+                 cache_key, classification, confidence, reason, created_at
+              )
+              SELECT cache_key, classification, confidence, reason, created_at
+             FROM current_snapshot.classification_cache
+             WHERE 1
+             ON CONFLICT(cache_key) DO UPDATE SET
+                 classification = excluded.classification,
+                 confidence = excluded.confidence,
+                 reason = excluded.reason,
+                 created_at = excluded.created_at
+             WHERE excluded.created_at > classification_cache.created_at;",
         )?;
         merge_settings(&tx)?;
         for date in affected_score_dates {
@@ -659,6 +692,22 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_cache(
+        conn: &Connection,
+        key: &str,
+        classification: &str,
+        reason: &str,
+        created_at: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO classification_cache(
+                cache_key, classification, confidence, reason, created_at
+             ) VALUES(?1, ?2, 0.9, ?3, ?4)",
+            params![key, classification, reason, created_at],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn restores_legacy_data_and_keeps_new_monitoring_samples() {
         let dir = tempfile::tempdir().unwrap();
@@ -673,6 +722,20 @@ mod tests {
             )
             .unwrap();
         insert_activity(&legacy, 100, "shared sample");
+        insert_cache(
+            &legacy,
+            "current-is-newer",
+            "productive",
+            "legacy stale",
+            100,
+        );
+        insert_cache(
+            &legacy,
+            "legacy-is-newer",
+            "productive",
+            "legacy newest",
+            300,
+        );
         let legacy_settings = Settings {
             work_end_min: 18 * 60,
             checkin_cadence_min: 60,
@@ -701,6 +764,20 @@ mod tests {
         target.pragma_update(None, "journal_mode", "WAL").unwrap();
         insert_activity(&target, 100, "shared sample");
         insert_activity(&target, 200, "new sample");
+        insert_cache(
+            &target,
+            "current-is-newer",
+            "distracting",
+            "current newest",
+            200,
+        );
+        insert_cache(
+            &target,
+            "legacy-is-newer",
+            "distracting",
+            "current stale",
+            200,
+        );
         let current_settings = Settings {
             work_end_min: 17 * 60,
             checkin_cadence_min: 45,
@@ -767,6 +844,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(refreshed_neutral_secs, 10);
+        let current_cache: (String, String, i64) = restored
+            .query_row(
+                "SELECT classification, reason, created_at
+                 FROM classification_cache WHERE cache_key='current-is-newer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            current_cache,
+            ("distracting".into(), "current newest".into(), 200),
+            "a newer installed-app classification must replace the legacy cache row"
+        );
+        let legacy_cache: (String, String, i64) = restored
+            .query_row(
+                "SELECT classification, reason, created_at
+                 FROM classification_cache WHERE cache_key='legacy-is-newer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_cache,
+            ("productive".into(), "legacy newest".into(), 300),
+            "an older installed-app classification must not replace the legacy cache row"
+        );
 
         let backup = Connection::open(backup_path).unwrap();
         let backup_sessions: i64 = backup
@@ -829,6 +932,38 @@ mod tests {
             .unwrap();
         assert_eq!(title, "Legacy task");
         validate_database(&restored).unwrap();
+    }
+
+    #[test]
+    fn completed_recovery_does_not_resurrect_deleted_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+        let legacy = initialized(&legacy_path);
+        legacy
+            .execute(
+                "INSERT INTO tasks(title, created_at) VALUES('Delete me later', 1)",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .expect("initial recovery should run");
+        let restored = Connection::open(&target_path).unwrap();
+        assert!(recovery_was_completed(&restored).unwrap());
+        restored.execute("DELETE FROM tasks", []).unwrap();
+        drop(restored);
+
+        assert!(recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .is_none());
+        let reopened = Connection::open(target_path).unwrap();
+        let tasks: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tasks, 0, "deleted tasks must stay deleted after restart");
     }
 
     #[test]
