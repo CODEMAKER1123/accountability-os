@@ -43,7 +43,7 @@ pub fn recover_codex_virtualized_database(target: &Path) -> AppResult<Option<Rec
 
         let mut scored = Vec::new();
         for candidate in candidates {
-            match open_read_only(&candidate).and_then(|conn| user_data_score(&conn)) {
+            match open_read_only(&candidate).and_then(|conn| recoverable_data_score(&conn)) {
                 Ok(score) if score > 0 => scored.push((score, candidate)),
                 Ok(_) => {}
                 Err(error) => {
@@ -124,7 +124,7 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     }
 
     let legacy_conn = open_read_only(legacy)?;
-    if user_data_score(&legacy_conn)? == 0 {
+    if recoverable_data_score(&legacy_conn)? == 0 {
         return Ok(None);
     }
 
@@ -238,7 +238,11 @@ fn restore_connection_into_path(source: &Connection, target: &Path) -> AppResult
     validate_database(&destination)
 }
 
-fn user_data_score(conn: &Connection) -> AppResult<i64> {
+fn recoverable_data_score(conn: &Connection) -> AppResult<i64> {
+    Ok(planning_data_score(conn)? + table_count_if_present(conn, "activity_sessions")?)
+}
+
+fn planning_data_score(conn: &Connection) -> AppResult<i64> {
     let mut score = 0;
     for table in [
         "projects",
@@ -269,7 +273,7 @@ fn user_data_score(conn: &Connection) -> AppResult<i64> {
 }
 
 fn is_fresh_installed_database(conn: &Connection) -> AppResult<bool> {
-    if user_data_score(conn)? != 0 {
+    if planning_data_score(conn)? != 0 {
         return Ok(false);
     }
     if table_exists(conn, "activity_sessions")? {
@@ -885,6 +889,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(backup_sessions, 2);
+    }
+
+    #[test]
+    fn activity_only_legacy_history_is_recovered_into_a_fresh_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+
+        let legacy = initialized(&legacy_path);
+        insert_activity(&legacy, 100, "legacy activity");
+        drop(legacy);
+
+        let target = initialized(&target_path);
+        insert_activity(&target, 200, "current activity");
+        drop(target);
+
+        let report = recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .expect("activity history alone should be recoverable");
+        assert_eq!(report.imported_activity_sessions, 1);
+
+        let restored = Connection::open(target_path).unwrap();
+        let sessions: i64 = restored
+            .query_row("SELECT COUNT(*) FROM activity_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sessions, 2);
     }
 
     #[test]
