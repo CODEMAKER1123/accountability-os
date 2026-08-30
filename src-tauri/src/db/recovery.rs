@@ -1,0 +1,683 @@
+//! One-time recovery for databases created by development builds launched
+//! from the packaged Codex app. Windows redirects those builds' roaming app
+//! data into Codex's package-local cache, while an installed build uses the
+//! normal roaming directory. This module safely joins those two histories.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, DatabaseName, OpenFlags};
+
+use crate::error::{AppError, AppResult};
+
+use super::migrations;
+
+const DATABASE_NAME: &str = "accountability.sqlite3";
+const APP_DATA_DIR_NAME: &str = "com.accountability-os.desktop";
+
+#[derive(Debug, Clone)]
+pub struct RecoveryReport {
+    pub source: PathBuf,
+    pub backup_path: Option<PathBuf>,
+    pub imported_activity_sessions: usize,
+}
+
+/// Recover the richest compatible database found in Codex's Windows package
+/// cache. A populated installed database always wins; this only repairs the
+/// specific split-brain state where the installed app has settings/default
+/// rules and monitoring samples, but no user-created planning data.
+pub fn recover_codex_virtualized_database(target: &Path) -> AppResult<Option<RecoveryReport>> {
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        Ok(None)
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+            return Ok(None);
+        };
+        let mut candidates = discover_codex_databases(Path::new(&local_app_data))?;
+        candidates.retain(|candidate| !same_file_path(candidate, target));
+
+        let mut scored = Vec::new();
+        for candidate in candidates {
+            match open_read_only(&candidate).and_then(|conn| user_data_score(&conn)) {
+                Ok(score) if score > 0 => scored.push((score, candidate)),
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!(
+                        target: "recovery",
+                        "ignoring unreadable Codex database {}: {error}",
+                        candidate.display()
+                    );
+                }
+            }
+        }
+        scored.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+
+        for (_, candidate) in scored {
+            match recover_legacy_database(target, &candidate) {
+                Ok(Some(mut report)) => {
+                    report.source = candidate;
+                    return Ok(Some(report));
+                }
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    log::warn!(
+                        target: "recovery",
+                        "could not recover Codex database {}: {error}",
+                        candidate.display()
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn discover_codex_databases(local_app_data: &Path) -> AppResult<Vec<PathBuf>> {
+    let packages = local_app_data.join("Packages");
+    if !packages.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(packages)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("openai.codex_")
+        {
+            continue;
+        }
+        let candidate = entry
+            .path()
+            .join("LocalCache")
+            .join("Roaming")
+            .join(APP_DATA_DIR_NAME)
+            .join(DATABASE_NAME);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Restore `legacy` only when `target` is a fresh installed database. The
+/// target is backed up first, its later monitoring samples are appended to a
+/// validated legacy snapshot, and only then is the target replaced through
+/// SQLite's online backup API.
+fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<RecoveryReport>> {
+    if !legacy.is_file() || same_file_path(target, legacy) {
+        return Ok(None);
+    }
+
+    let legacy_conn = open_read_only(legacy)?;
+    if user_data_score(&legacy_conn)? == 0 {
+        return Ok(None);
+    }
+
+    let target_has_database = match target.metadata() {
+        Ok(metadata) => metadata.len() > 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let target_conn = if target_has_database {
+        // Open through the exact path the installed app uses and fold any
+        // committed WAL pages into the main file before taking the snapshot.
+        // This avoids carrying stale sidecars across the restore boundary.
+        let conn = Connection::open(target)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        if !is_fresh_installed_database(&conn)? {
+            return Ok(None);
+        }
+        checkpoint_wal(&conn)?;
+        Some(conn)
+    } else {
+        None
+    };
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let stamp = recovery_stamp();
+    let backup_path = if let Some(target_conn) = target_conn.as_ref() {
+        let backup_dir = target
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("recovery-backups");
+        std::fs::create_dir_all(&backup_dir)?;
+        let path = backup_dir.join(format!(
+            "accountability-before-legacy-recovery-{stamp}.sqlite3"
+        ));
+        target_conn.backup(DatabaseName::Main, &path, None)?;
+        Some(path)
+    } else {
+        None
+    };
+
+    let temp_path = target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".accountability-legacy-recovery-{stamp}.tmp.sqlite3"
+        ));
+    let temp_guard = TemporaryDatabase::new(temp_path);
+    legacy_conn.backup(DatabaseName::Main, temp_guard.path(), None)?;
+    drop(legacy_conn);
+
+    let consolidated = Connection::open(temp_guard.path())?;
+    consolidated.pragma_update(None, "foreign_keys", "ON")?;
+    migrations::apply(&consolidated)?;
+
+    let imported_activity_sessions = if let Some(snapshot_path) = backup_path.as_ref() {
+        append_fresh_target_data(&consolidated, snapshot_path)?
+    } else {
+        0
+    };
+    validate_database(&consolidated)?;
+
+    drop(target_conn);
+    let restore_result = restore_connection_into_path(&consolidated, target);
+    if let Err(restore_error) = restore_result {
+        if let Some(snapshot_path) = backup_path.as_ref() {
+            let snapshot = open_read_only(snapshot_path)?;
+            if let Err(rollback_error) = restore_connection_into_path(&snapshot, target) {
+                return Err(AppError::Internal(format!(
+                    "legacy recovery failed: {restore_error}; restoring the pre-recovery backup also failed: {rollback_error}"
+                )));
+            }
+        }
+        return Err(restore_error);
+    }
+    drop(consolidated);
+
+    Ok(Some(RecoveryReport {
+        source: legacy.to_path_buf(),
+        backup_path,
+        imported_activity_sessions,
+    }))
+}
+
+fn open_read_only(path: &Path) -> AppResult<Connection> {
+    Ok(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?)
+}
+
+fn restore_connection_into_path(source: &Connection, target: &Path) -> AppResult<()> {
+    let mut destination = Connection::open(target)?;
+    destination.busy_timeout(std::time::Duration::from_secs(5))?;
+    {
+        let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
+        backup.run_to_completion(100, std::time::Duration::from_millis(5), None)?;
+    }
+    destination.pragma_update(None, "foreign_keys", "ON")?;
+    checkpoint_wal(&destination)?;
+    validate_database(&destination)
+}
+
+fn user_data_score(conn: &Connection) -> AppResult<i64> {
+    let mut score = 0;
+    for table in [
+        "projects",
+        "tasks",
+        "daily_plans",
+        "daily_commitments",
+        "activity_corrections",
+        "application_rules",
+        "focus_sessions",
+        "checkins",
+        "checkin_responses",
+        "interruptions",
+        "breaks",
+        "daily_reviews",
+        "daily_scores",
+        "ai_insights",
+    ] {
+        score += table_count_if_present(conn, table)?;
+    }
+    if table_exists(conn, "domain_rules")? {
+        score += conn.query_row(
+            "SELECT COUNT(*) FROM domain_rules WHERE is_default = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+    }
+    Ok(score)
+}
+
+fn is_fresh_installed_database(conn: &Connection) -> AppResult<bool> {
+    if user_data_score(conn)? != 0 {
+        return Ok(false);
+    }
+    if table_exists(conn, "activity_sessions")? {
+        let linked_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM activity_sessions
+             WHERE related_task_id IS NOT NULL OR related_commitment_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if linked_sessions != 0 {
+            return Ok(false);
+        }
+    }
+    if table_exists(conn, "domain_rules")? {
+        let linked_rules: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM domain_rules
+             WHERE is_default = 0 OR project_id IS NOT NULL OR commitment_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if linked_rules != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+fn table_count_if_present(conn: &Connection, table: &str) -> AppResult<i64> {
+    if !table_exists(conn, table)? {
+        return Ok(0);
+    }
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+}
+
+fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResult<usize> {
+    conn.execute(
+        "ATTACH DATABASE ?1 AS current_snapshot",
+        [snapshot_path.to_string_lossy().as_ref()],
+    )?;
+
+    let result = (|| -> AppResult<usize> {
+        let tx = conn.unchecked_transaction()?;
+        let imported = tx.execute(
+            "INSERT INTO main.activity_sessions (
+                local_date, started_at, ended_at, duration_seconds,
+                application_name, process_name, window_title,
+                browser_domain, browser_title, classification,
+                classification_confidence, classification_source,
+                classification_reason, related_task_id,
+                related_commitment_id, is_idle, pending_ai, created_at
+             )
+             SELECT
+                current.local_date, current.started_at, current.ended_at,
+                current.duration_seconds, current.application_name,
+                current.process_name, current.window_title,
+                current.browser_domain, current.browser_title,
+                current.classification, current.classification_confidence,
+                current.classification_source, current.classification_reason,
+                NULL, NULL, current.is_idle, current.pending_ai,
+                current.created_at
+             FROM current_snapshot.activity_sessions current
+             WHERE NOT EXISTS (
+                SELECT 1 FROM main.activity_sessions legacy
+                WHERE legacy.started_at = current.started_at
+                  AND legacy.ended_at = current.ended_at
+                  AND legacy.application_name = current.application_name
+                  AND legacy.process_name = current.process_name
+                  AND legacy.window_title = current.window_title
+                  AND COALESCE(legacy.browser_domain, '') =
+                      COALESCE(current.browser_domain, '')
+             )",
+            [],
+        )?;
+
+        tx.execute_batch(
+            "INSERT INTO main.domain_rules (
+                domain, classification, project_id, commitment_id,
+                only_in_focus, is_default, created_at
+             )
+             SELECT current.domain, current.classification, NULL, NULL,
+                    current.only_in_focus, current.is_default,
+                    current.created_at
+             FROM current_snapshot.domain_rules current
+             WHERE current.is_default = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.domain_rules legacy
+                   WHERE legacy.domain = current.domain
+                     AND legacy.classification = current.classification
+                     AND legacy.only_in_focus = current.only_in_focus
+                     AND legacy.is_default = 1
+               );
+
+             INSERT OR IGNORE INTO main.classification_cache (
+                cache_key, classification, confidence, reason, created_at
+             )
+             SELECT cache_key, classification, confidence, reason, created_at
+             FROM current_snapshot.classification_cache;",
+        )?;
+        merge_settings(&tx)?;
+        tx.commit()?;
+        Ok(imported)
+    })();
+
+    let detach_result = conn.execute_batch("DETACH DATABASE current_snapshot;");
+    match (result, detach_result) {
+        (Ok(imported), Ok(())) => Ok(imported),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+fn merge_settings(conn: &Connection) -> AppResult<()> {
+    let legacy: Option<String> = optional_setting(conn, "main")?;
+    let current: Option<String> = optional_setting(conn, "current_snapshot")?;
+    let (Some(legacy), Some(current)) = (legacy, current) else {
+        return Ok(());
+    };
+
+    let mut legacy_json: serde_json::Value = serde_json::from_str(&legacy)?;
+    let current_json: serde_json::Value = serde_json::from_str(&current)?;
+    let (Some(legacy_object), Some(current_object)) =
+        (legacy_json.as_object_mut(), current_json.as_object())
+    else {
+        return Ok(());
+    };
+
+    for (key, value) in current_object {
+        legacy_object
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    if let Some(token) = current_object
+        .get("extension_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+    {
+        legacy_object.insert(
+            "extension_token".into(),
+            serde_json::Value::String(token.into()),
+        );
+    }
+
+    conn.execute(
+        "UPDATE main.settings SET value = ?1 WHERE key = 'app_settings'",
+        [serde_json::to_string(&legacy_json)?],
+    )?;
+    Ok(())
+}
+
+fn optional_setting(conn: &Connection, schema: &str) -> AppResult<Option<String>> {
+    let sql = format!("SELECT value FROM {schema}.settings WHERE key = 'app_settings'");
+    match conn.query_row(&sql, [], |row| row.get(0)) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_database(conn: &Connection) -> AppResult<()> {
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(AppError::Internal(format!(
+            "database integrity check failed: {integrity}"
+        )));
+    }
+    let foreign_key_errors: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_errors != 0 {
+        return Err(AppError::Internal(format!(
+            "database has {foreign_key_errors} foreign-key violation(s)"
+        )));
+    }
+    Ok(())
+}
+
+fn checkpoint_wal(conn: &Connection) -> AppResult<()> {
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(AppError::Internal(
+            "database WAL is busy; recovery was not applied".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_stamp() -> String {
+    format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%fZ"),
+        std::process::id()
+    )
+}
+
+struct TemporaryDatabase {
+    path: PathBuf,
+}
+
+impl TemporaryDatabase {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryDatabase {
+    fn drop(&mut self) {
+        for path in [
+            self.path.clone(),
+            sidecar_path(&self.path, "-wal"),
+            sidecar_path(&self.path, "-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    path.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::settings::{self, Settings};
+    use rusqlite::params;
+
+    fn initialized(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        migrations::apply(&conn).unwrap();
+        conn
+    }
+
+    fn insert_activity(conn: &Connection, started_at: i64, title: &str) {
+        conn.execute(
+            "INSERT INTO activity_sessions(
+                local_date, started_at, ended_at, duration_seconds,
+                application_name, process_name, window_title,
+                classification, classification_source, created_at
+             ) VALUES('2026-08-30', ?1, ?1 + 5, 5, 'Test', 'test.exe',
+                      ?2, 'neutral', 'default', ?1)",
+            params![started_at, title],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn restores_legacy_data_and_keeps_new_monitoring_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+
+        let legacy = initialized(&legacy_path);
+        legacy
+            .execute(
+                "INSERT INTO tasks(title, created_at) VALUES('Recovered task', 1)",
+                [],
+            )
+            .unwrap();
+        insert_activity(&legacy, 100, "shared sample");
+        let legacy_settings = Settings {
+            work_end_min: 18 * 60,
+            extension_token: "legacy-extension-token".into(),
+            onboarding_completed: true,
+            ..Settings::default()
+        };
+        settings::save(&legacy, &legacy_settings).unwrap();
+        drop(legacy);
+
+        let target = initialized(&target_path);
+        target.pragma_update(None, "journal_mode", "WAL").unwrap();
+        insert_activity(&target, 100, "shared sample");
+        insert_activity(&target, 200, "new sample");
+        let current_settings = Settings {
+            work_end_min: 17 * 60,
+            extension_token: "current-extension-token".into(),
+            onboarding_completed: true,
+            ..Settings::default()
+        };
+        settings::save(&target, &current_settings).unwrap();
+        drop(target);
+
+        let report = recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .expect("recovery should run");
+
+        assert_eq!(report.imported_activity_sessions, 1);
+        let backup_path = report.backup_path.expect("existing target is backed up");
+        assert!(backup_path.is_file());
+
+        let restored = Connection::open(&target_path).unwrap();
+        let tasks: i64 = restored
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let sessions: i64 = restored
+            .query_row("SELECT COUNT(*) FROM activity_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tasks, 1);
+        assert_eq!(sessions, 2, "the duplicate sample must not be copied twice");
+
+        let restored_settings = settings::load(&restored).unwrap();
+        assert_eq!(restored_settings.work_end_min, 18 * 60);
+        assert_eq!(
+            restored_settings.extension_token, "current-extension-token",
+            "the browser bridge must keep the installed app's token"
+        );
+
+        let backup = Connection::open(backup_path).unwrap();
+        let backup_sessions: i64 = backup
+            .query_row("SELECT COUNT(*) FROM activity_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(backup_sessions, 2);
+    }
+
+    #[test]
+    fn populated_target_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+        for (path, title) in [
+            (&legacy_path, "Legacy task"),
+            (&target_path, "Current task"),
+        ] {
+            let conn = initialized(path);
+            conn.execute(
+                "INSERT INTO tasks(title, created_at) VALUES(?1, 1)",
+                [title],
+            )
+            .unwrap();
+        }
+
+        assert!(recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .is_none());
+        let target = Connection::open(target_path).unwrap();
+        let title: String = target
+            .query_row("SELECT title FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "Current task");
+    }
+
+    #[test]
+    fn missing_target_is_restored_without_inventing_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+        let legacy = initialized(&legacy_path);
+        legacy
+            .execute(
+                "INSERT INTO tasks(title, created_at) VALUES('Legacy task', 1)",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let report = recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .expect("recovery should create the target");
+        assert!(report.backup_path.is_none());
+
+        let restored = Connection::open(target_path).unwrap();
+        let title: String = restored
+            .query_row("SELECT title FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "Legacy task");
+        validate_database(&restored).unwrap();
+    }
+
+    #[test]
+    fn discovers_only_codex_package_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir
+            .path()
+            .join("Packages")
+            .join("OpenAI.Codex_example")
+            .join("LocalCache")
+            .join("Roaming")
+            .join(APP_DATA_DIR_NAME)
+            .join(DATABASE_NAME);
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&expected, b"sqlite placeholder").unwrap();
+
+        let ignored = dir
+            .path()
+            .join("Packages")
+            .join("Unrelated.App")
+            .join("LocalCache")
+            .join("Roaming")
+            .join(APP_DATA_DIR_NAME)
+            .join(DATABASE_NAME);
+        std::fs::create_dir_all(ignored.parent().unwrap()).unwrap();
+        std::fs::write(ignored, b"sqlite placeholder").unwrap();
+
+        assert_eq!(
+            discover_codex_databases(dir.path()).unwrap(),
+            vec![expected]
+        );
+    }
+}

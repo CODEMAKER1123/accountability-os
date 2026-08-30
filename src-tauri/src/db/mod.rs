@@ -2,6 +2,7 @@ pub mod engine_data;
 pub mod migrations;
 pub mod models;
 pub mod plans;
+pub mod recovery;
 pub mod rules;
 pub mod scores;
 pub mod sessions;
