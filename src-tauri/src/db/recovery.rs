@@ -13,7 +13,11 @@ use super::{migrations, scores};
 
 const DATABASE_NAME: &str = "accountability.sqlite3";
 const APP_DATA_DIR_NAME: &str = "com.accountability-os.desktop";
+const CODEX_PACKAGE_FAMILY_DIR: &str = "OpenAI.Codex_2p2nqsd0c76g0";
 const RECOVERY_MARKER_KEY: &str = "codex_virtualized_database_recovery_v1";
+const ROLLBACK_TEMP_PREFIX: &str = ".accountability-before-legacy-recovery-";
+const CONSOLIDATED_TEMP_PREFIX: &str = ".accountability-legacy-recovery-";
+const RESCUE_PREFIX: &str = "accountability-recovery-rescue-";
 
 #[derive(Debug, Clone)]
 pub struct RecoveryReport {
@@ -49,6 +53,7 @@ pub fn recover_codex_virtualized_database(target: &Path) -> AppResult<Option<Rec
 
     #[cfg(windows)]
     {
+        cleanup_stale_recovery_temps(target)?;
         let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
             return Ok(None);
         };
@@ -92,33 +97,22 @@ pub fn recover_codex_virtualized_database(target: &Path) -> AppResult<Option<Rec
 }
 
 fn discover_codex_databases(local_app_data: &Path) -> AppResult<Vec<PathBuf>> {
-    let packages = local_app_data.join("Packages");
-    if !packages.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut candidates = Vec::new();
-    for entry in std::fs::read_dir(packages)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if !name
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("openai.codex_")
-        {
-            continue;
-        }
-        let candidate = entry
-            .path()
-            .join("LocalCache")
-            .join("Roaming")
-            .join(APP_DATA_DIR_NAME)
-            .join(DATABASE_NAME);
-        if candidate.is_file() {
-            candidates.push(candidate);
-        }
-    }
-    Ok(candidates)
+    // The package-family suffix is OpenAI's stable Windows publisher ID.
+    // Restricting recovery to this exact family identifies the one package
+    // that virtualized this app's development data and avoids combining data
+    // from unrelated preview/test package identities.
+    let candidate = local_app_data
+        .join("Packages")
+        .join(CODEX_PACKAGE_FAMILY_DIR)
+        .join("LocalCache")
+        .join("Roaming")
+        .join(APP_DATA_DIR_NAME)
+        .join(DATABASE_NAME);
+    Ok(candidate
+        .is_file()
+        .then_some(candidate)
+        .into_iter()
+        .collect())
 }
 
 fn same_file_path(left: &Path, right: &Path) -> bool {
@@ -178,9 +172,7 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
         let path = target
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(format!(
-                ".accountability-before-legacy-recovery-{stamp}.tmp.sqlite3"
-            ));
+            .join(format!("{ROLLBACK_TEMP_PREFIX}{stamp}.tmp.sqlite3"));
         let snapshot = TemporaryDatabase::new(path);
         target_conn.backup(DatabaseName::Main, snapshot.path(), None)?;
         Some(snapshot)
@@ -191,9 +183,7 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     let temp_path = target
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(
-            ".accountability-legacy-recovery-{stamp}.tmp.sqlite3"
-        ));
+        .join(format!("{CONSOLIDATED_TEMP_PREFIX}{stamp}.tmp.sqlite3"));
     let temp_guard = TemporaryDatabase::new(temp_path);
     legacy_conn.backup(DatabaseName::Main, temp_guard.path(), None)?;
     drop(legacy_conn);
@@ -217,8 +207,17 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
             let rollback_result = open_read_only(snapshot_guard.path())
                 .and_then(|snapshot| restore_connection_into_path(&snapshot, target));
             if let Err(rollback_error) = rollback_result {
-                let preserved_path = snapshot_guard.path().to_path_buf();
-                snapshot_guard.preserve();
+                let rescue_path = target
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(format!("{RESCUE_PREFIX}{stamp}.sqlite3"));
+                let preserved_path = match snapshot_guard.preserve_as(rescue_path) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        snapshot_guard.preserve();
+                        snapshot_guard.path().to_path_buf()
+                    }
+                };
                 return Err(AppError::Internal(format!(
                     "legacy recovery failed: {restore_error}; restoring the rollback snapshot also failed: {rollback_error}; snapshot preserved at {}",
                     preserved_path.display()
@@ -736,6 +735,30 @@ fn recovery_stamp() -> String {
     )
 }
 
+fn cleanup_stale_recovery_temps(target: &Path) -> AppResult<()> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(ROLLBACK_TEMP_PREFIX) || name.starts_with(CONSOLIDATED_TEMP_PREFIX) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 struct TemporaryDatabase {
     path: PathBuf,
     remove_on_drop: bool,
@@ -755,6 +778,21 @@ impl TemporaryDatabase {
 
     fn preserve(&mut self) {
         self.remove_on_drop = false;
+    }
+
+    fn preserve_as(&mut self, destination: PathBuf) -> AppResult<PathBuf> {
+        let original = self.path.clone();
+        if let Err(rename_error) = std::fs::rename(&original, &destination) {
+            std::fs::copy(&original, &destination).map_err(|copy_error| {
+                AppError::Internal(format!(
+                    "could not preserve recovery snapshot: rename failed ({rename_error}); copy failed ({copy_error})"
+                ))
+            })?;
+            let _ = std::fs::remove_file(&original);
+        }
+        self.path = destination.clone();
+        self.remove_on_drop = false;
+        Ok(destination)
     }
 
     fn cleanup(mut self) -> AppResult<()> {
@@ -1310,12 +1348,38 @@ mod tests {
     }
 
     #[test]
-    fn discovers_only_codex_package_databases() {
+    fn stale_temp_cleanup_preserves_distinct_rescue_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(DATABASE_NAME);
+        let rollback = dir
+            .path()
+            .join(format!("{ROLLBACK_TEMP_PREFIX}old.tmp.sqlite3"));
+        let rollback_wal = sidecar_path(&rollback, "-wal");
+        let consolidated = dir
+            .path()
+            .join(format!("{CONSOLIDATED_TEMP_PREFIX}old.tmp.sqlite3"));
+        let rescue = dir.path().join(format!("{RESCUE_PREFIX}kept.sqlite3"));
+        let unrelated = dir.path().join("notes.txt");
+        for path in [&rollback, &rollback_wal, &consolidated, &rescue, &unrelated] {
+            std::fs::write(path, b"test").unwrap();
+        }
+
+        cleanup_stale_recovery_temps(&target).unwrap();
+
+        assert!(!rollback.exists());
+        assert!(!rollback_wal.exists());
+        assert!(!consolidated.exists());
+        assert!(rescue.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn discovers_only_the_official_codex_package_family() {
         let dir = tempfile::tempdir().unwrap();
         let expected = dir
             .path()
             .join("Packages")
-            .join("OpenAI.Codex_example")
+            .join(CODEX_PACKAGE_FAMILY_DIR)
             .join("LocalCache")
             .join("Roaming")
             .join(APP_DATA_DIR_NAME)
@@ -1326,7 +1390,7 @@ mod tests {
         let ignored = dir
             .path()
             .join("Packages")
-            .join("Unrelated.App")
+            .join("OpenAI.Codex_preview")
             .join("LocalCache")
             .join("Roaming")
             .join(APP_DATA_DIR_NAME)
