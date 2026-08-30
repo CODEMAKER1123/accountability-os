@@ -9,7 +9,7 @@ use rusqlite::{Connection, DatabaseName, OpenFlags};
 
 use crate::error::{AppError, AppResult};
 
-use super::migrations;
+use super::{migrations, scores};
 
 const DATABASE_NAME: &str = "accountability.sqlite3";
 const APP_DATA_DIR_NAME: &str = "com.accountability-os.desktop";
@@ -314,6 +314,7 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
 
     let result = (|| -> AppResult<usize> {
         let tx = conn.unchecked_transaction()?;
+        let affected_score_dates = activity_dates_to_import(&tx)?;
         let imported = tx.execute(
             "INSERT INTO main.activity_sessions (
                 local_date, started_at, ended_at, duration_seconds,
@@ -371,6 +372,9 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
              FROM current_snapshot.classification_cache;",
         )?;
         merge_settings(&tx)?;
+        for date in affected_score_dates {
+            scores::refresh_stored_score(&tx, &date)?;
+        }
         tx.commit()?;
         Ok(imported)
     })();
@@ -383,6 +387,25 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
     }
 }
 
+fn activity_dates_to_import(conn: &Connection) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT current.local_date
+         FROM current_snapshot.activity_sessions current
+         WHERE NOT EXISTS (
+            SELECT 1 FROM main.activity_sessions legacy
+            WHERE legacy.started_at = current.started_at
+              AND legacy.ended_at = current.ended_at
+              AND legacy.application_name = current.application_name
+              AND legacy.process_name = current.process_name
+              AND legacy.window_title = current.window_title
+              AND COALESCE(legacy.browser_domain, '') =
+                  COALESCE(current.browser_domain, '')
+         )",
+    )?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 fn merge_settings(conn: &Connection) -> AppResult<()> {
     let legacy: Option<String> = optional_setting(conn, "main")?;
     let current: Option<String> = optional_setting(conn, "current_snapshot")?;
@@ -390,35 +413,147 @@ fn merge_settings(conn: &Connection) -> AppResult<()> {
         return Ok(());
     };
 
-    let mut legacy_json: serde_json::Value = serde_json::from_str(&legacy)?;
+    let legacy_json: serde_json::Value = serde_json::from_str(&legacy)?;
     let current_json: serde_json::Value = serde_json::from_str(&current)?;
-    let (Some(legacy_object), Some(current_object)) =
-        (legacy_json.as_object_mut(), current_json.as_object())
-    else {
-        return Ok(());
-    };
-
-    for (key, value) in current_object {
-        legacy_object
-            .entry(key.clone())
-            .or_insert_with(|| value.clone());
-    }
-    if let Some(token) = current_object
-        .get("extension_token")
-        .and_then(serde_json::Value::as_str)
-        .filter(|token| !token.is_empty())
-    {
-        legacy_object.insert(
-            "extension_token".into(),
-            serde_json::Value::String(token.into()),
-        );
-    }
+    let merged = merged_settings(legacy_json, current_json)?;
 
     conn.execute(
         "UPDATE main.settings SET value = ?1 WHERE key = 'app_settings'",
-        [serde_json::to_string(&legacy_json)?],
+        [serde_json::to_string(&merged)?],
     )?;
     Ok(())
+}
+
+fn merged_settings(
+    mut legacy: serde_json::Value,
+    current: serde_json::Value,
+) -> AppResult<serde_json::Value> {
+    let defaults = serde_json::to_value(super::settings::Settings::default())?;
+    let (Some(legacy_object), Some(current_object), Some(default_object)) = (
+        legacy.as_object_mut(),
+        current.as_object(),
+        defaults.as_object(),
+    ) else {
+        return Ok(legacy);
+    };
+
+    // A value that differs from the installed version's default was changed
+    // after installation, so it is newer intent. Default-valued fields keep
+    // the richer legacy preference instead of resetting work hours, strict
+    // mode, or the widget just because the installed app launched once.
+    for (key, value) in current_object {
+        if is_privacy_or_installation_local_setting(key) {
+            continue;
+        }
+        if !legacy_object.contains_key(key) || default_object.get(key) != Some(value) {
+            legacy_object.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Privacy is monotonic: recovery must never broaden collection or AI use,
+    // discard an exclusion, or lengthen retention. Consent is explicitly tied
+    // to the currently installed app. The extension bridge token/port are also
+    // installation-local and must stay current.
+    copy_current_value(legacy_object, current_object, "monitoring_consent");
+    for key in [
+        "browser_monitoring_enabled",
+        "ai_classification_enabled",
+        "ai_coaching_enabled",
+    ] {
+        merge_boolean_and(legacy_object, current_object, key);
+    }
+    for key in ["excluded_apps", "excluded_domains", "private_apps"] {
+        merge_string_array_union(legacy_object, current_object, key);
+    }
+    merge_integer_min(legacy_object, current_object, "activity_retention_days");
+    copy_current_value(legacy_object, current_object, "extension_port");
+    copy_current_value(legacy_object, current_object, "extension_token");
+
+    Ok(legacy)
+}
+
+fn is_privacy_or_installation_local_setting(key: &str) -> bool {
+    matches!(
+        key,
+        "monitoring_consent"
+            | "browser_monitoring_enabled"
+            | "ai_classification_enabled"
+            | "ai_coaching_enabled"
+            | "excluded_apps"
+            | "excluded_domains"
+            | "private_apps"
+            | "activity_retention_days"
+            | "extension_port"
+            | "extension_token"
+    )
+}
+
+fn copy_current_value(
+    legacy: &mut serde_json::Map<String, serde_json::Value>,
+    current: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    if let Some(value) = current.get(key) {
+        legacy.insert(key.into(), value.clone());
+    }
+}
+
+fn merge_boolean_and(
+    legacy: &mut serde_json::Map<String, serde_json::Value>,
+    current: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let Some(current_value) = current.get(key).and_then(serde_json::Value::as_bool) else {
+        return;
+    };
+    let legacy_value = legacy
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    legacy.insert(
+        key.into(),
+        serde_json::Value::Bool(legacy_value && current_value),
+    );
+}
+
+fn merge_integer_min(
+    legacy: &mut serde_json::Map<String, serde_json::Value>,
+    current: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let Some(current_value) = current.get(key).and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let merged = legacy
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map_or(current_value, |legacy_value| {
+            legacy_value.min(current_value)
+        });
+    legacy.insert(key.into(), serde_json::Value::from(merged));
+}
+
+fn merge_string_array_union(
+    legacy: &mut serde_json::Map<String, serde_json::Value>,
+    current: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let mut merged = Vec::new();
+    for value in [legacy.get(key), current.get(key)]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if !merged.iter().any(|existing| existing == value) {
+            merged.push(value.to_string());
+        }
+    }
+    legacy.insert(
+        key.into(),
+        serde_json::Value::Array(merged.into_iter().map(serde_json::Value::String).collect()),
+    );
 }
 
 fn optional_setting(conn: &Connection, schema: &str) -> AppResult<Option<String>> {
@@ -540,11 +675,26 @@ mod tests {
         insert_activity(&legacy, 100, "shared sample");
         let legacy_settings = Settings {
             work_end_min: 18 * 60,
+            checkin_cadence_min: 60,
+            strict_mode: true,
+            monitoring_consent: true,
+            ai_classification_enabled: true,
+            ai_coaching_enabled: true,
+            excluded_apps: vec!["legacy-private.exe".into()],
+            private_apps: vec!["legacy-secret.exe".into()],
             extension_token: "legacy-extension-token".into(),
             onboarding_completed: true,
             ..Settings::default()
         };
         settings::save(&legacy, &legacy_settings).unwrap();
+        legacy
+            .execute(
+                "INSERT INTO daily_scores(
+                    date, neutral_secs, context_switches, computed_at
+                 ) VALUES('2026-08-30', 5, 0, 1)",
+                [],
+            )
+            .unwrap();
         drop(legacy);
 
         let target = initialized(&target_path);
@@ -553,6 +703,14 @@ mod tests {
         insert_activity(&target, 200, "new sample");
         let current_settings = Settings {
             work_end_min: 17 * 60,
+            checkin_cadence_min: 45,
+            monitoring_consent: false,
+            browser_monitoring_enabled: false,
+            activity_retention_days: 30,
+            ai_classification_enabled: false,
+            ai_coaching_enabled: false,
+            excluded_apps: vec!["current-private.exe".into()],
+            private_apps: vec!["current-secret.exe".into()],
             extension_token: "current-extension-token".into(),
             onboarding_completed: true,
             ..Settings::default()
@@ -582,10 +740,33 @@ mod tests {
 
         let restored_settings = settings::load(&restored).unwrap();
         assert_eq!(restored_settings.work_end_min, 18 * 60);
+        assert_eq!(restored_settings.checkin_cadence_min, 45);
+        assert!(restored_settings.strict_mode);
+        assert!(!restored_settings.monitoring_consent);
+        assert!(!restored_settings.browser_monitoring_enabled);
+        assert!(!restored_settings.ai_classification_enabled);
+        assert!(!restored_settings.ai_coaching_enabled);
+        assert_eq!(restored_settings.activity_retention_days, 30);
+        assert_eq!(
+            restored_settings.excluded_apps,
+            vec!["legacy-private.exe", "current-private.exe"]
+        );
+        assert_eq!(
+            restored_settings.private_apps,
+            vec!["legacy-secret.exe", "current-secret.exe"]
+        );
         assert_eq!(
             restored_settings.extension_token, "current-extension-token",
             "the browser bridge must keep the installed app's token"
         );
+        let refreshed_neutral_secs: i64 = restored
+            .query_row(
+                "SELECT neutral_secs FROM daily_scores WHERE date='2026-08-30'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refreshed_neutral_secs, 10);
 
         let backup = Connection::open(backup_path).unwrap();
         let backup_sessions: i64 = backup
