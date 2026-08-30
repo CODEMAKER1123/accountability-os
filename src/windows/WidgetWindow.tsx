@@ -180,8 +180,11 @@ export default function WidgetWindow() {
       return;
     }
     await run(`task-${task.id}`, async () => {
-      const prepared = commitment ?? (await api.prepareTaskForToday(task.id));
-      await api.startCommitment(prepared.id);
+      if (commitment) {
+        await api.startCommitment(commitment.id);
+      } else {
+        await api.startTask(task.id);
+      }
     });
   };
 

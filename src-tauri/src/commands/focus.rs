@@ -79,6 +79,35 @@ fn current_contract(
     Ok((focus, current_id))
 }
 
+fn ensure_task_start_without_switch_allowed(
+    conn: &rusqlite::Connection,
+    task_id: i64,
+) -> AppResult<()> {
+    plans::validate_task_for_today(conn, task_id)?;
+    let (_, current_id) = current_contract(conn)?;
+    if current_id.is_some() {
+        return Err(AppError::invalid(
+            "Use Switch priority and explain what changed before starting another task.",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_and_start_task(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+) -> AppResult<(Commitment, i64, ActiveCommitment, Option<i64>)> {
+    // This check must happen before preparation so a stale task-list snapshot
+    // cannot reserve one of today's three slots when another focus has begun.
+    ensure_task_start_without_switch_allowed(tx, task_id)?;
+    let (commitment, newly_locked_plan_id) = plans::prepare_task_for_today(tx, task_id)?;
+    ensure_direct_start_allowed(tx, commitment.id)?;
+    let commitment = plans::activate_commitment(tx, commitment.id)?;
+    let focus = engine_data::start_focus(tx, commitment.id)?;
+    let active = load_active(tx, &commitment)?;
+    Ok((commitment, focus.id, active, newly_locked_plan_id))
+}
+
 /// Start (or resume) working on a commitment: opens a focus session and
 /// makes it the active commitment.
 #[tauri::command]
@@ -110,6 +139,54 @@ pub fn start_commitment(
     drop(history_guard);
     emit_event(&app, &AppEvent::FocusStarted { commitment_id });
     emit_event(&app, &AppEvent::CommitmentChanged { commitment_id: Some(commitment_id) });
+    crate::tray::refresh(&app);
+    Ok(commitment)
+}
+
+/// Prepare an unplanned backlog task and start it as one atomic operation.
+/// Task-list callers use this instead of committing a Today slot first and
+/// starting focus in a second command.
+#[tauri::command]
+pub fn start_task(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> AppResult<Commitment> {
+    let history_guard = state.activity_history_boundary.lock();
+    state
+        .db
+        .with(|conn| ensure_task_start_without_switch_allowed(conn, task_id))?;
+    crate::engine::flush_open_session(&app);
+    let (commitment, focus_id, active, newly_locked_plan_id) = state
+        .db
+        .with_tx(|tx| prepare_and_start_task(tx, task_id))?;
+    {
+        let mut engine = state.engine.lock();
+        engine.active_commitment = Some(active);
+        engine.focus_session_id = Some(focus_id);
+        if newly_locked_plan_id.is_some() {
+            engine.checkin.last_at = crate::db::now();
+            engine.interview_snoozes = 0;
+            engine.interview_snoozed_until = None;
+        }
+        engine.tracker.resolve();
+    }
+    drop(history_guard);
+    if let Some(plan_id) = newly_locked_plan_id {
+        emit_event(&app, &AppEvent::DayLocked { plan_id });
+    }
+    emit_event(
+        &app,
+        &AppEvent::FocusStarted {
+            commitment_id: commitment.id,
+        },
+    );
+    emit_event(
+        &app,
+        &AppEvent::CommitmentChanged {
+            commitment_id: Some(commitment.id),
+        },
+    );
     crate::tray::refresh(&app);
     Ok(commitment)
 }
@@ -465,6 +542,24 @@ mod tests {
     use super::*;
     use aos_core::types::Classification;
 
+    fn backlog_task(conn: &rusqlite::Connection, title: &str) -> crate::db::models::Task {
+        tasks::create(
+            conn,
+            &tasks::TaskInput {
+                title: title.into(),
+                description: format!("{title} has a reviewed, verifiable result."),
+                project_id: None,
+                parent_task_id: None,
+                status: "inbox".into(),
+                priority: "must".into(),
+                estimated_minutes: Some(30),
+                due_date: None,
+                tags: vec![],
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn clearing_another_commitment_preserves_the_live_distraction_episode() {
         let mut engine = crate::state::EngineState::new(crate::db::settings::Settings::default());
@@ -489,5 +584,36 @@ mod tests {
         assert!(engine.active_commitment.is_none());
         assert!(engine.focus_session_id.is_none());
         assert!(engine.tracker.episode_started_at().is_none());
+    }
+
+    #[test]
+    fn atomic_task_start_rejects_stale_empty_focus_without_consuming_a_slot() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        let source = backlog_task(&conn, "Current focus");
+        let target = backlog_task(&conn, "Stale widget target");
+        let source_commitment = {
+            let tx = conn.transaction().unwrap();
+            let commitment = plans::prepare_task_for_today(&tx, source.id).unwrap().0;
+            plans::activate_commitment(&tx, commitment.id).unwrap();
+            engine_data::start_focus(&tx, commitment.id).unwrap();
+            tx.commit().unwrap();
+            commitment
+        };
+
+        let tx = conn.transaction().unwrap();
+        let error = prepare_and_start_task(&tx, target.id)
+            .unwrap_err()
+            .to_string();
+        drop(tx);
+
+        assert!(error.contains("Switch priority"), "{error}");
+        assert_eq!(
+            plans::list_commitments(&conn, source_commitment.plan_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(tasks::get(&conn, target.id).unwrap().status, "inbox");
     }
 }

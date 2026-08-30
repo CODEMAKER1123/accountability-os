@@ -119,30 +119,11 @@ export default function Tasks() {
         return;
       }
 
-      const commitment = existingCommitment ?? (await api.prepareTaskForToday(task.id));
-      if (!existingCommitment) {
-        await Promise.all([reload(), refreshSnapshot()]);
+      if (existingCommitment) {
+        await api.startCommitment(existingCommitment.id);
+      } else {
+        await api.startTask(task.id);
       }
-
-      // Re-read the store after preparing an unplanned task. Another window
-      // may also have changed focus since this row was rendered.
-      const latest = useStore.getState().snapshot;
-      const latestActiveId = latest?.active_commitment?.id ?? null;
-      const latestPausedId =
-        latestActiveId == null
-          ? latest?.commitments.find((item) => item.status === "active")?.id ?? null
-          : null;
-      const latestContractId = latestActiveId ?? latestPausedId;
-      if (latestContractId != null && latestContractId !== commitment.id) {
-        setModal({
-          kind: "switch",
-          fromCommitmentId: latestContractId,
-          toCommitmentId: commitment.id,
-        });
-        return;
-      }
-
-      await api.startCommitment(commitment.id);
       await Promise.all([reload(), refreshSnapshot()]);
     } catch (caught) {
       setError(errorMessage(caught));
