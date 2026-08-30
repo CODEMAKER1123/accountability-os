@@ -48,14 +48,9 @@ pub fn run() {
             match db::recovery::recover_codex_virtualized_database(&db_path) {
                 Ok(Some(report)) => log::info!(
                     target: "recovery",
-                    "restored database from {}; preserved {} newer activity sessions; backup: {}",
+                    "restored database from {}; preserved {} newer activity sessions; rollback snapshot removed",
                     report.source.display(),
-                    report.imported_activity_sessions,
-                    report
-                        .backup_path
-                        .as_deref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "not needed".into())
+                    report.imported_activity_sessions
                 ),
                 Ok(None) => {}
                 Err(error) => log::error!(

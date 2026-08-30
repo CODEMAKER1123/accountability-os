@@ -18,7 +18,6 @@ const RECOVERY_MARKER_KEY: &str = "codex_virtualized_database_recovery_v1";
 #[derive(Debug, Clone)]
 pub struct RecoveryReport {
     pub source: PathBuf,
-    pub backup_path: Option<PathBuf>,
     pub imported_activity_sessions: usize,
 }
 
@@ -28,11 +27,12 @@ struct RecoveryDataScore {
     // database with planning/user-authored state over activity-only history.
     planning_rows: i64,
     activity_sessions: i64,
+    derived_history_rows: i64,
 }
 
 impl RecoveryDataScore {
     fn has_data(self) -> bool {
-        self.planning_rows > 0 || self.activity_sessions > 0
+        self.planning_rows > 0 || self.activity_sessions > 0 || self.derived_history_rows > 0
     }
 }
 
@@ -174,17 +174,16 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     }
 
     let stamp = recovery_stamp();
-    let backup_path = if let Some(target_conn) = target_conn.as_ref() {
-        let backup_dir = target
+    let mut rollback_snapshot = if let Some(target_conn) = target_conn.as_ref() {
+        let path = target
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("recovery-backups");
-        std::fs::create_dir_all(&backup_dir)?;
-        let path = backup_dir.join(format!(
-            "accountability-before-legacy-recovery-{stamp}.sqlite3"
-        ));
-        target_conn.backup(DatabaseName::Main, &path, None)?;
-        Some(path)
+            .join(format!(
+                ".accountability-before-legacy-recovery-{stamp}.tmp.sqlite3"
+            ));
+        let snapshot = TemporaryDatabase::new(path);
+        target_conn.backup(DatabaseName::Main, snapshot.path(), None)?;
+        Some(snapshot)
     } else {
         None
     };
@@ -203,8 +202,8 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     consolidated.pragma_update(None, "foreign_keys", "ON")?;
     migrations::apply(&consolidated)?;
 
-    let imported_activity_sessions = if let Some(snapshot_path) = backup_path.as_ref() {
-        append_fresh_target_data(&consolidated, snapshot_path)?
+    let imported_activity_sessions = if let Some(snapshot) = rollback_snapshot.as_ref() {
+        append_fresh_target_data(&consolidated, snapshot.path())?
     } else {
         0
     };
@@ -214,21 +213,27 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     drop(target_conn);
     let restore_result = restore_connection_into_path(&consolidated, target);
     if let Err(restore_error) = restore_result {
-        if let Some(snapshot_path) = backup_path.as_ref() {
-            let snapshot = open_read_only(snapshot_path)?;
-            if let Err(rollback_error) = restore_connection_into_path(&snapshot, target) {
+        if let Some(snapshot_guard) = rollback_snapshot.as_mut() {
+            let rollback_result = open_read_only(snapshot_guard.path())
+                .and_then(|snapshot| restore_connection_into_path(&snapshot, target));
+            if let Err(rollback_error) = rollback_result {
+                let preserved_path = snapshot_guard.path().to_path_buf();
+                snapshot_guard.preserve();
                 return Err(AppError::Internal(format!(
-                    "legacy recovery failed: {restore_error}; restoring the pre-recovery backup also failed: {rollback_error}"
+                    "legacy recovery failed: {restore_error}; restoring the rollback snapshot also failed: {rollback_error}; snapshot preserved at {}",
+                    preserved_path.display()
                 )));
             }
         }
         return Err(restore_error);
     }
     drop(consolidated);
+    if let Some(snapshot) = rollback_snapshot {
+        snapshot.cleanup()?;
+    }
 
     Ok(Some(RecoveryReport {
         source: legacy.to_path_buf(),
-        backup_path,
         imported_activity_sessions,
     }))
 }
@@ -254,12 +259,17 @@ fn restore_connection_into_path(source: &Connection, target: &Path) -> AppResult
 
 fn recoverable_data_score(conn: &Connection) -> AppResult<RecoveryDataScore> {
     Ok(RecoveryDataScore {
-        planning_rows: planning_data_score(conn)?,
+        planning_rows: user_authored_data_score(conn)?,
         activity_sessions: table_count_if_present(conn, "activity_sessions")?,
+        derived_history_rows: ["checkins", "interruptions", "daily_scores", "ai_insights"]
+            .into_iter()
+            .try_fold(0_i64, |total, table| {
+                Ok::<_, AppError>(total + table_count_if_present(conn, table)?)
+            })?,
     })
 }
 
-fn planning_data_score(conn: &Connection) -> AppResult<i64> {
+fn user_authored_data_score(conn: &Connection) -> AppResult<i64> {
     let mut score = 0;
     for table in [
         "projects",
@@ -269,13 +279,9 @@ fn planning_data_score(conn: &Connection) -> AppResult<i64> {
         "activity_corrections",
         "application_rules",
         "focus_sessions",
-        "checkins",
         "checkin_responses",
-        "interruptions",
         "breaks",
         "daily_reviews",
-        "daily_scores",
-        "ai_insights",
     ] {
         score += table_count_if_present(conn, table)?;
     }
@@ -286,11 +292,28 @@ fn planning_data_score(conn: &Connection) -> AppResult<i64> {
             |row| row.get::<_, i64>(0),
         )?;
     }
+    if table_exists(conn, "checkins")? {
+        score += conn.query_row(
+            "SELECT COUNT(*) FROM checkins WHERE commitment_id IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+    }
+    if table_exists(conn, "interruptions")? {
+        score += conn.query_row(
+            "SELECT COUNT(*) FROM interruptions
+             WHERE commitment_id IS NOT NULL
+                OR response IS NOT NULL
+                OR response_note IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+    }
     Ok(score)
 }
 
 fn is_fresh_installed_database(conn: &Connection) -> AppResult<bool> {
-    if planning_data_score(conn)? != 0 {
+    if user_authored_data_score(conn)? != 0 {
         return Ok(false);
     }
     if table_exists(conn, "activity_sessions")? {
@@ -662,28 +685,53 @@ fn recovery_stamp() -> String {
 
 struct TemporaryDatabase {
     path: PathBuf,
+    remove_on_drop: bool,
 }
 
 impl TemporaryDatabase {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            remove_on_drop: true,
+        }
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn preserve(&mut self) {
+        self.remove_on_drop = false;
+    }
+
+    fn cleanup(mut self) -> AppResult<()> {
+        remove_database_files(&self.path)?;
+        self.remove_on_drop = false;
+        Ok(())
+    }
 }
 
 impl Drop for TemporaryDatabase {
     fn drop(&mut self) {
-        for path in [
-            self.path.clone(),
-            sidecar_path(&self.path, "-wal"),
-            sidecar_path(&self.path, "-shm"),
-        ] {
-            let _ = std::fs::remove_file(path);
+        if self.remove_on_drop {
+            let _ = remove_database_files(&self.path);
         }
     }
+}
+
+fn remove_database_files(database: &Path) -> AppResult<()> {
+    for path in [
+        database.to_path_buf(),
+        sidecar_path(database, "-wal"),
+        sidecar_path(database, "-shm"),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
@@ -825,8 +873,6 @@ mod tests {
             .expect("recovery should run");
 
         assert_eq!(report.imported_activity_sessions, 1);
-        let backup_path = report.backup_path.expect("existing target is backed up");
-        assert!(backup_path.is_file());
 
         let restored = Connection::open(&target_path).unwrap();
         let tasks: i64 = restored
@@ -896,13 +942,16 @@ mod tests {
             "an older installed-app classification must not replace the legacy cache row"
         );
 
-        let backup = Connection::open(backup_path).unwrap();
-        let backup_sessions: i64 = backup
-            .query_row("SELECT COUNT(*) FROM activity_sessions", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(backup_sessions, 2);
+        let rollback_snapshots: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".accountability-before-legacy-recovery-"))
+            .collect();
+        assert!(
+            rollback_snapshots.is_empty(),
+            "successful recovery must remove its privacy-sensitive rollback snapshot"
+        );
     }
 
     #[test]
@@ -931,6 +980,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(sessions, 2);
+    }
+
+    #[test]
+    fn derived_insights_do_not_block_legacy_planning_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+
+        let legacy = initialized(&legacy_path);
+        legacy
+            .execute(
+                "INSERT INTO tasks(title, created_at) VALUES('Legacy plan', 1)",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let target = initialized(&target_path);
+        insert_activity(&target, 200, "current activity");
+        target
+            .execute(
+                "INSERT INTO daily_scores(date, total, computed_at)
+                 VALUES('2026-08-30', 50.0, 200)",
+                [],
+            )
+            .unwrap();
+        target
+            .execute(
+                "INSERT INTO ai_insights(period, metric, text, source, created_at)
+                 VALUES('week', 'focus', 'Derived insight', 'deterministic', 200)",
+                [],
+            )
+            .unwrap();
+        drop(target);
+
+        recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .expect("derived rows must not retire the legacy plan");
+        let restored = Connection::open(target_path).unwrap();
+        let tasks: i64 = restored
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let sessions: i64 = restored
+            .query_row("SELECT COUNT(*) FROM activity_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tasks, 1);
+        assert_eq!(sessions, 1);
     }
 
     #[test]
@@ -1074,10 +1172,9 @@ mod tests {
             .unwrap();
         drop(legacy);
 
-        let report = recover_legacy_database(&target_path, &legacy_path)
+        recover_legacy_database(&target_path, &legacy_path)
             .unwrap()
             .expect("recovery should create the target");
-        assert!(report.backup_path.is_none());
 
         let restored = Connection::open(target_path).unwrap();
         let title: String = restored
