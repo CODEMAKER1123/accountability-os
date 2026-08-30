@@ -1,17 +1,19 @@
 // Tasks — standard backlog (spec §4 Tasks).
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { BreakdownEditor } from "@/components/BreakdownEditor";
 import { EmptyState, ErrorBanner, PriorityTag } from "@/components/shared";
 import {
   api,
   errorMessage,
+  type Commitment,
   type Priority,
   type Project,
   type Task,
   type TaskStatus,
 } from "@/lib/ipc";
+import { useStore } from "@/lib/store";
 import { flattenTaskHierarchy } from "@/lib/taskBreakdown";
 
 const STATUS_FILTERS: { id: TaskStatus | "open"; label: string }[] = [
@@ -26,6 +28,7 @@ const STATUS_FILTERS: { id: TaskStatus | "open"; label: string }[] = [
 ];
 
 export default function Tasks() {
+  const { snapshot, refreshSnapshot, setModal } = useStore();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [allOpenTasks, setAllOpenTasks] = useState<Task[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -34,6 +37,8 @@ export default function Tasks() {
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Task | null>(null);
   const [showProjects, setShowProjects] = useState(false);
+  const [startingTaskId, setStartingTaskId] = useState<number | null>(null);
+  const startInProgress = useRef(false);
 
   const reload = useCallback(async () => {
     try {
@@ -61,6 +66,62 @@ export default function Tasks() {
       directChildren,
     ]),
   );
+  const todayCommitmentByTask = new Map<number, Commitment>();
+  for (const commitment of snapshot?.commitments ?? []) {
+    if (
+      commitment.task_id != null &&
+      !["completed", "deferred", "dropped", "cancelled"].includes(commitment.status)
+    ) {
+      todayCommitmentByTask.set(commitment.task_id, commitment);
+    }
+  }
+  const activeCommitmentId = snapshot?.active_commitment?.id ?? null;
+  const pausedCommitmentId =
+    activeCommitmentId == null
+      ? snapshot?.commitments.find((commitment) => commitment.status === "active")?.id ?? null
+      : null;
+  const currentContractId = activeCommitmentId ?? pausedCommitmentId;
+  const now = Math.floor(Date.now() / 1000);
+  const onBreak = Boolean(snapshot?.current_break && snapshot.current_break.ends_at > now);
+
+  const startTask = async (task: Task, existingCommitment: Commitment | null) => {
+    if (startInProgress.current || onBreak) return;
+    startInProgress.current = true;
+    setStartingTaskId(task.id);
+    setError(null);
+    try {
+      const commitment = existingCommitment ?? (await api.prepareTaskForToday(task.id));
+      if (!existingCommitment) {
+        await Promise.all([reload(), refreshSnapshot()]);
+      }
+
+      // Re-read the store after preparing an unplanned task. Another window
+      // may also have changed focus since this row was rendered.
+      const latest = useStore.getState().snapshot;
+      const latestActiveId = latest?.active_commitment?.id ?? null;
+      const latestPausedId =
+        latestActiveId == null
+          ? latest?.commitments.find((item) => item.status === "active")?.id ?? null
+          : null;
+      const latestContractId = latestActiveId ?? latestPausedId;
+      if (latestContractId != null && latestContractId !== commitment.id) {
+        setModal({
+          kind: "switch",
+          fromCommitmentId: latestContractId,
+          toCommitmentId: commitment.id,
+        });
+        return;
+      }
+
+      await api.startCommitment(commitment.id);
+      await Promise.all([reload(), refreshSnapshot()]);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      startInProgress.current = false;
+      setStartingTaskId(null);
+    }
+  };
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
@@ -119,6 +180,14 @@ export default function Tasks() {
               depth={depth}
               childTasks={allChildrenByParent.get(task.id) ?? directChildren}
               projects={projects}
+              todayCommitment={todayCommitmentByTask.get(task.id) ?? null}
+              activeCommitmentId={activeCommitmentId}
+              pausedCommitmentId={pausedCommitmentId}
+              currentContractId={currentContractId}
+              onBreak={onBreak}
+              starting={startingTaskId === task.id}
+              startBusy={startingTaskId != null}
+              onStart={startTask}
               onChanged={reload}
               editing={editing?.id === task.id}
               setEditing={(open) => setEditing(open ? task : null)}
@@ -295,6 +364,14 @@ function TaskRow({
   depth,
   childTasks,
   projects,
+  todayCommitment,
+  activeCommitmentId,
+  pausedCommitmentId,
+  currentContractId,
+  onBreak,
+  starting,
+  startBusy,
+  onStart,
   onChanged,
   editing,
   setEditing,
@@ -304,6 +381,14 @@ function TaskRow({
   depth: number;
   childTasks: Task[];
   projects: Project[];
+  todayCommitment: Commitment | null;
+  activeCommitmentId: number | null;
+  pausedCommitmentId: number | null;
+  currentContractId: number | null;
+  onBreak: boolean;
+  starting: boolean;
+  startBusy: boolean;
+  onStart: (task: Task, commitment: Commitment | null) => Promise<void>;
   onChanged: () => Promise<void>;
   editing: boolean;
   setEditing: (open: boolean) => void;
@@ -313,6 +398,9 @@ function TaskRow({
   const project = projects.find((p) => p.id === task.project_id);
   const done = task.status === "completed";
   const terminal = done || task.status === "cancelled";
+  const focusActive = todayCommitment?.id === activeCommitmentId;
+  const focusPaused = todayCommitment?.id === pausedCommitmentId;
+  const requiresSwitch = currentContractId != null && todayCommitment?.id !== currentContractId;
   const completedSteps = childTasks.filter((child) => child.status === "completed").length;
   return (
     <div className="px-3 py-2" style={{ paddingLeft: `${12 + Math.min(depth, 5) * 24}px` }}>
@@ -351,6 +439,27 @@ function TaskRow({
             {childTasks.length > 0 && ` · ${completedSteps}/${childTasks.length} steps`}
           </span>
         </button>
+        {!terminal &&
+          (focusActive ? (
+            <span className="shrink-0 text-xs font-medium text-focus">Active</span>
+          ) : (
+            <button
+              className={`btn shrink-0 py-1 ${requiresSwitch ? "" : "btn-primary"}`}
+              disabled={startBusy || onBreak}
+              title={onBreak ? "End the current break before starting work." : undefined}
+              onClick={() => void onStart(task, todayCommitment)}
+            >
+              {onBreak
+                ? "On break"
+                : starting
+                  ? "Starting…"
+                  : requiresSwitch
+                    ? "Switch"
+                    : focusPaused
+                      ? "Resume"
+                      : "Start"}
+            </button>
+          ))}
         {!terminal && (
           <button
             className="btn btn-ghost shrink-0 px-2 py-1 text-accent"

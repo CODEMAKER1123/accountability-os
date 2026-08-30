@@ -1,7 +1,7 @@
 {
   "name": "accountability-os",
   "private": true,
-  "version": "0.3.3",
+  "version": "0.3.4",
   "type": "module",
   "description": "AI desktop productivity & focus coach. Plan, commit, monitor, interrupt, score, review, improve.",
   "scripts": {

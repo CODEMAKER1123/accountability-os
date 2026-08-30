@@ -128,6 +128,7 @@ pub fn run() {
             commands::mark_day_off,
             commands::snooze_interview,
             commands::commitment_limit_check,
+            commands::prepare_task_for_today,
             commands::set_commitment_step_completed,
             commands::add_commitment_steps,
             // focus / commitments
