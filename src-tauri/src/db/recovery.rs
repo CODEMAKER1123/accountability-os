@@ -22,6 +22,20 @@ pub struct RecoveryReport {
     pub imported_activity_sessions: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct RecoveryDataScore {
+    // Field order is intentional: lexicographic ordering must always prefer a
+    // database with planning/user-authored state over activity-only history.
+    planning_rows: i64,
+    activity_sessions: i64,
+}
+
+impl RecoveryDataScore {
+    fn has_data(self) -> bool {
+        self.planning_rows > 0 || self.activity_sessions > 0
+    }
+}
+
 /// Recover the richest compatible database found in Codex's Windows package
 /// cache. A populated installed database always wins; this only repairs the
 /// specific split-brain state where the installed app has settings/default
@@ -44,7 +58,7 @@ pub fn recover_codex_virtualized_database(target: &Path) -> AppResult<Option<Rec
         let mut scored = Vec::new();
         for candidate in candidates {
             match open_read_only(&candidate).and_then(|conn| recoverable_data_score(&conn)) {
-                Ok(score) if score > 0 => scored.push((score, candidate)),
+                Ok(score) if score.has_data() => scored.push((score, candidate)),
                 Ok(_) => {}
                 Err(error) => {
                     log::warn!(
@@ -124,7 +138,7 @@ fn recover_legacy_database(target: &Path, legacy: &Path) -> AppResult<Option<Rec
     }
 
     let legacy_conn = open_read_only(legacy)?;
-    if recoverable_data_score(&legacy_conn)? == 0 {
+    if !recoverable_data_score(&legacy_conn)?.has_data() {
         return Ok(None);
     }
 
@@ -238,8 +252,11 @@ fn restore_connection_into_path(source: &Connection, target: &Path) -> AppResult
     validate_database(&destination)
 }
 
-fn recoverable_data_score(conn: &Connection) -> AppResult<i64> {
-    Ok(planning_data_score(conn)? + table_count_if_present(conn, "activity_sessions")?)
+fn recoverable_data_score(conn: &Connection) -> AppResult<RecoveryDataScore> {
+    Ok(RecoveryDataScore {
+        planning_rows: planning_data_score(conn)?,
+        activity_sessions: table_count_if_present(conn, "activity_sessions")?,
+    })
 }
 
 fn planning_data_score(conn: &Connection) -> AppResult<i64> {
@@ -384,8 +401,12 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
             [],
         )?;
 
+        // Defaults are editable in the UI. Replacing that subset exactly is
+        // what preserves an intentional deletion from the installed app.
         tx.execute_batch(
-            "INSERT INTO main.domain_rules (
+            "DELETE FROM main.domain_rules WHERE is_default = 1;
+
+             INSERT INTO main.domain_rules (
                 domain, classification, project_id, commitment_id,
                 only_in_focus, is_default, created_at
              )
@@ -393,14 +414,7 @@ fn append_fresh_target_data(conn: &Connection, snapshot_path: &Path) -> AppResul
                     current.only_in_focus, current.is_default,
                     current.created_at
              FROM current_snapshot.domain_rules current
-             WHERE current.is_default = 1
-               AND NOT EXISTS (
-                   SELECT 1 FROM main.domain_rules legacy
-                   WHERE legacy.domain = current.domain
-                     AND legacy.classification = current.classification
-                     AND legacy.only_in_focus = current.only_in_focus
-                     AND legacy.is_default = 1
-               );
+             WHERE current.is_default = 1;
 
              INSERT INTO main.classification_cache (
                  cache_key, classification, confidence, reason, created_at
@@ -917,6 +931,94 @@ mod tests {
             })
             .unwrap();
         assert_eq!(sessions, 2);
+    }
+
+    #[test]
+    fn planning_data_outranks_any_activity_only_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let planning_path = dir.path().join("planning.sqlite3");
+        let activity_path = dir.path().join("activity.sqlite3");
+
+        let planning = initialized(&planning_path);
+        planning
+            .execute(
+                "INSERT INTO tasks(title, created_at) VALUES('Important plan', 1)",
+                [],
+            )
+            .unwrap();
+
+        let activity = initialized(&activity_path);
+        for started_at in 1..=100 {
+            insert_activity(&activity, started_at * 10, &format!("sample {started_at}"));
+        }
+
+        assert!(
+            recoverable_data_score(&planning).unwrap() > recoverable_data_score(&activity).unwrap()
+        );
+    }
+
+    #[test]
+    fn installed_default_rule_deletions_survive_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.sqlite3");
+        let target_path = dir.path().join(DATABASE_NAME);
+
+        let legacy = initialized(&legacy_path);
+        legacy
+            .execute(
+                "INSERT INTO tasks(title, created_at) VALUES('Legacy task', 1)",
+                [],
+            )
+            .unwrap();
+        crate::db::rules::seed_defaults(&legacy).unwrap();
+        drop(legacy);
+
+        let target = initialized(&target_path);
+        crate::db::rules::seed_defaults(&target).unwrap();
+        let removed_domain: String = target
+            .query_row(
+                "SELECT domain FROM domain_rules WHERE is_default=1 ORDER BY domain LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        target
+            .execute(
+                "DELETE FROM domain_rules WHERE is_default=1 AND domain=?1",
+                [&removed_domain],
+            )
+            .unwrap();
+        let remaining_defaults: i64 = target
+            .query_row(
+                "SELECT COUNT(*) FROM domain_rules WHERE is_default=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(remaining_defaults > 0);
+        drop(target);
+
+        recover_legacy_database(&target_path, &legacy_path)
+            .unwrap()
+            .expect("recovery should run");
+        let restored = Connection::open(target_path).unwrap();
+        let resurrected: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM domain_rules
+                 WHERE is_default=1 AND domain=?1",
+                [&removed_domain],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resurrected, 0);
+        let restored_defaults: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM domain_rules WHERE is_default=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_defaults, remaining_defaults);
     }
 
     #[test]
