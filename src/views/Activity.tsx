@@ -4,7 +4,8 @@
 import { useCallback, useEffect, useState } from "react";
 
 import Timeline from "@/components/Timeline";
-import { ClassBadge, EmptyState, CLASS_LABEL } from "@/components/shared";
+import Dialog from "@/components/Dialog";
+import { ClassBadge, EmptyState, ErrorBanner, CLASS_LABEL } from "@/components/shared";
 import {
   api,
   errorMessage,
@@ -22,12 +23,19 @@ export default function Activity() {
   const [searchResults, setSearchResults] = useState<ActivitySession[] | null>(null);
   const [correcting, setCorrecting] = useState<ActivitySession | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchRetry, setSearchRetry] = useState(0);
 
   const reload = useCallback(async () => {
+    setLoading(true);
     try {
       setTimeline(await api.getTimeline(date));
+      setError(null);
     } catch (e) {
       setError(errorMessage(e));
+    } finally {
+      setLoading(false);
     }
   }, [date]);
 
@@ -42,13 +50,21 @@ export default function Activity() {
   useEffect(() => {
     if (search.trim().length < 2) {
       setSearchResults(null);
+      setSearchError(null);
       return;
     }
+    setSearchError(null);
     const t = setTimeout(() => {
-      void api.searchActivity(search).then(setSearchResults).catch(() => setSearchResults([]));
+      void api
+        .searchActivity(search)
+        .then(setSearchResults)
+        .catch((caught) => {
+          setSearchResults(null);
+          setSearchError(errorMessage(caught));
+        });
     }, 250);
     return () => clearTimeout(t);
-  }, [search]);
+  }, [search, searchRetry]);
 
   const sessions = searchResults ?? timeline?.sessions ?? [];
 
@@ -59,6 +75,7 @@ export default function Activity() {
         <div className="flex items-center gap-2">
           <input
             className="input w-64"
+            aria-label="Search activity"
             placeholder='Search apps, titles, domains… e.g. "Outlook"'
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -81,13 +98,26 @@ export default function Activity() {
         </div>
       </div>
 
-      {error && <p className="text-xs text-distracted">{error}</p>}
+      {error && <ErrorBanner message={error} onRetry={() => void reload()} onDismiss={() => setError(null)} />}
+      {searchError && (
+        <ErrorBanner
+          message={`Activity search failed: ${searchError}`}
+          onRetry={() => setSearchRetry((count) => count + 1)}
+          onDismiss={() => setSearchError(null)}
+        />
+      )}
 
-      {!searchResults && timeline && timeline.sessions.length > 0 && (
+      {loading && !timeline ? (
+        <div className="card text-xs text-ink-400" role="status">
+          Loading activity…
+        </div>
+      ) : null}
+
+      {!loading && !searchResults && timeline && timeline.sessions.length > 0 && (
         <Timeline data={timeline} onSelect={setCorrecting} />
       )}
 
-      {sessions.length === 0 ? (
+      {(loading && !timeline) ? null : sessions.length === 0 ? (
         <EmptyState
           title={searchResults ? "No matches" : "No activity recorded for this day"}
           hint={
@@ -183,12 +213,8 @@ function CorrectionDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" onClick={onClose}>
-      <div
-        className="w-full max-w-md rounded-xl border border-ink-600 bg-ink-900 p-5 shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <p className="section-title mb-1">Reclassify activity</p>
+    <Dialog labelledBy="reclassify-activity-title" onClose={onClose} panelClassName="w-full max-w-md rounded-xl border border-ink-600 bg-ink-900 p-5 shadow-2xl">
+        <p id="reclassify-activity-title" className="section-title mb-1">Reclassify activity</p>
         <p className="truncate text-sm font-medium text-ink-50">
           {session.is_idle ? "Desktop idle" : session.application_name}
           {session.browser_domain && ` · ${session.browser_domain}`}
@@ -282,7 +308,6 @@ function CorrectionDialog({
             Save correction
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }

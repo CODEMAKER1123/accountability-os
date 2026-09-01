@@ -19,11 +19,13 @@ export function BreakdownEditor({
   existingSteps,
   onSave,
   onClose,
+  destination = "commitment",
 }: {
   goal: string;
   existingSteps: string[];
   onSave: (steps: string[]) => Promise<void>;
   onClose: () => void;
+  destination?: "commitment" | "task";
 }) {
   const { settings, setView } = useStore();
   const [detail, setDetail] = useState<BreakdownDetail>("standard");
@@ -64,6 +66,11 @@ export function BreakdownEditor({
           <p className="text-xs font-semibold text-ink-100">Break into steps</p>
           <p className="mt-0.5 text-2xs text-ink-400">
             Generate editable suggestions or add your own. Saved steps become checkable work.
+          </p>
+          <p className="mt-1 text-2xs text-accent/80">
+            {destination === "task"
+              ? "These steps will be saved as child tasks in your backlog."
+              : "These steps stay with today’s commitment and can be checked off there."}
           </p>
         </div>
         <button className="btn btn-ghost px-2 py-1" onClick={onClose} aria-label="Close step editor">

@@ -9,7 +9,11 @@ const QUERY_KINDS = new Set<Exclude<WindowKind, null>>(["popup", "widget", "capt
  * their stable Tauri label. The query-string fallback remains useful when a
  * surface is previewed in a normal browser during development.
  */
-export function resolveWindowKind(search: string, tauriLabel?: string | null): WindowKind {
+export function resolveWindowKind(
+  search: string,
+  tauriLabel?: string | null,
+  hash = "",
+): WindowKind {
   if (tauriLabel != null) {
     if (tauriLabel === "intervention") return "popup";
     if (tauriLabel === "widget") return "widget";
@@ -17,7 +21,9 @@ export function resolveWindowKind(search: string, tauriLabel?: string | null): W
     return null;
   }
 
-  const requested = new URLSearchParams(search).get("window");
+  const requested =
+    new URLSearchParams(search).get("window") ??
+    new URLSearchParams(hash.replace(/^#/, "")).get("window");
   return requested && QUERY_KINDS.has(requested as Exclude<WindowKind, null>)
     ? (requested as Exclude<WindowKind, null>)
     : null;

@@ -6,7 +6,14 @@ import { useStore } from "@/lib/store";
 import { fmtDuration, fmtTime } from "@/lib/time";
 
 export default function Plan() {
-  const { snapshot, setModal } = useStore();
+  const { snapshot, snapshotLoading, setModal } = useStore();
+  if (!snapshot) {
+    return (
+      <div className="mx-auto max-w-3xl p-6 text-xs text-ink-400" role="status">
+        {snapshotLoading ? "Loading today’s plan…" : "Today’s plan is unavailable."}
+      </div>
+    );
+  }
   const plan = snapshot?.plan ?? null;
   const commitments = snapshot?.commitments ?? [];
   const locked = plan?.locked_at != null;
@@ -49,7 +56,10 @@ export default function Plan() {
                   without losing focus history or checked steps.
                 </p>
               </div>
-              <p className="shrink-0 text-2xs text-ink-500">locked {fmtTime(plan!.locked_at!)}</p>
+              <p className="shrink-0 text-2xs text-ink-500">
+                {plan!.ended_at != null ? "read-only · ended " : "locked "}
+                {fmtTime(plan!.ended_at ?? plan!.locked_at!)}
+              </p>
             </div>
             <ol className="space-y-2">
               {commitments.map((c) => (

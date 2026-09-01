@@ -3,6 +3,7 @@
 
 import { useState } from "react";
 
+import Dialog from "@/components/Dialog";
 import { api, errorMessage } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 
@@ -42,9 +43,8 @@ export default function BlockedModal({ commitmentId }: { commitmentId: number })
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-      <div className="w-full max-w-md rounded-xl border border-ink-600 bg-ink-900 p-5 shadow-2xl">
-        <p className="text-sm font-semibold text-ink-50">I'm blocked</p>
+    <Dialog labelledBy="blocked-title" onClose={() => setModal(null)} panelClassName="w-full max-w-md rounded-xl border border-ink-600 bg-ink-900 p-5 shadow-2xl">
+        <p id="blocked-title" className="text-sm font-semibold text-ink-50">I'm blocked</p>
         {commitment && <p className="mt-1 text-xs text-ink-400">{commitment.title}</p>}
 
         <label className="label mt-4">What is blocking you?</label>
@@ -84,7 +84,6 @@ export default function BlockedModal({ commitmentId }: { commitmentId: number })
             Mark blocked
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }

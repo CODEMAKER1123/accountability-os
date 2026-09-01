@@ -10,7 +10,7 @@ import { useStore } from "@/lib/store";
 import { fmtClockDuration, fmtDuration, fmtMinOfDay, fmtTime } from "@/lib/time";
 
 export default function Today() {
-  const { snapshot, refreshSnapshot, setModal } = useStore();
+  const { snapshot, snapshotLoading, refreshSnapshot, setModal, showToast } = useStore();
   const [, forceTick] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -85,6 +85,11 @@ export default function Today() {
       {actionError && (
         <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
       )}
+      {snapshotLoading && (
+        <p className="text-2xs text-ink-500" role="status" aria-live="polite">
+          Refreshing today…
+        </p>
+      )}
 
       {/* Break banner */}
       {onBreak && snapshot.current_break && (
@@ -120,6 +125,7 @@ export default function Today() {
             0
           }
           onError={setActionError}
+          showToast={showToast}
         />
       ) : !planLocked ? (
         <div className="card flex items-center justify-between">
@@ -191,8 +197,10 @@ export default function Today() {
               )}
             </div>
           ) : (
-            <p className="text-xs text-ink-500">
-              {snapshot.monitoring_message ?? "Monitoring is not reporting activity."}
+                <p className="text-xs text-ink-500">
+              {snapshot.monitoring_state === "active" || snapshot.monitoring_state === "demo"
+                ? "Monitoring is active; waiting for the next foreground activity sample."
+                : snapshot.monitoring_message ?? "Monitoring is not reporting activity."}
             </p>
           )}
           <div className="mt-4 grid grid-cols-5 gap-2 border-t border-ink-700 pt-3">
@@ -253,11 +261,13 @@ function ActiveCommitmentCard({
   focusElapsed,
   focusedSecs,
   onError,
+  showToast,
 }: {
   commitment: Commitment;
   focusElapsed: number;
   focusedSecs: number;
   onError: (message: string | null) => void;
+  showToast: (message: string) => void;
 }) {
   const { refreshSnapshot, setModal } = useStore();
   const [busyAction, setBusyAction] = useState<"complete" | "pause" | null>(null);
@@ -269,6 +279,7 @@ function ActiveCommitmentCard({
     try {
       await action();
       await refreshSnapshot();
+      if (kind === "complete") showToast(`Marked “${commitment.title}” complete.`);
     } catch (error) {
       onError(errorMessage(error));
     } finally {
@@ -340,6 +351,7 @@ function CommitmentRow({
   onError: (message: string | null) => void;
 }) {
   const { refreshSnapshot, snapshot, setModal } = useStore();
+  const showToast = useStore((state) => state.showToast);
   const [starting, setStarting] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [showSteps, setShowSteps] = useState(false);
@@ -365,6 +377,7 @@ function CommitmentRow({
     try {
       await api.completeCommitment(commitment.id);
       await refreshSnapshot();
+      showToast(`Marked “${commitment.title}” complete.`);
     } catch (error) {
       onError(errorMessage(error));
     } finally {
@@ -416,7 +429,7 @@ function CommitmentRow({
                 disabled={completing || starting}
                 onClick={() => void complete()}
               >
-                {completing ? "Completing…" : "Done"}
+                {completing ? "Completing…" : "Done today"}
               </button>
             )}
             {isActive ? (

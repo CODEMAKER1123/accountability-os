@@ -25,6 +25,7 @@ export function CommitmentSteps({
     <BreakdownEditor
       goal={commitment.title}
       existingSteps={commitment.steps.map((step) => step.title)}
+      destination="commitment"
       onClose={() => setBreakingDown(false)}
       onSave={async (steps) => {
         await api.addCommitmentSteps(commitment.id, steps);

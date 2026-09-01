@@ -1,6 +1,9 @@
 // Small shared UI atoms. Color logic per spec §39: subdued, not a scoreboard.
 
+import { useEffect } from "react";
+
 import type { Classification, MonitoringState } from "@/lib/ipc";
+import { useStore } from "@/lib/store";
 
 export const CLASS_COLORS: Record<Classification, string> = {
   focused: "text-focus",
@@ -103,7 +106,13 @@ export function ScoreRing({ value, size = 64, label }: { value: number | null; s
   const color = value === null ? "#4a5561" : v >= 75 ? "#4ea87c" : v >= 50 ? "#d9a052" : "#c96f5e";
   return (
     <div className="flex flex-col items-center gap-1">
-      <svg width={size} height={size} className="-rotate-90">
+      <svg
+        width={size}
+        height={size}
+        className="-rotate-90"
+        role="img"
+        aria-label={`${label}: ${value === null ? "not available" : `${Math.round(v)} percent`}`}
+      >
         <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#232a32" strokeWidth={5} />
         <circle
           cx={size / 2}
@@ -131,6 +140,46 @@ export function ScoreRing({ value, size = 64, label }: { value: number | null; s
         </text>
       </svg>
       <span className="text-2xs uppercase tracking-wider text-ink-400">{label}</span>
+    </div>
+  );
+}
+
+export function ToastHost() {
+  const toast = useStore((state) => state.toast);
+  const dismissToast = useStore((state) => state.dismissToast);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timeout = window.setTimeout(dismissToast, 4500);
+    return () => window.clearTimeout(timeout);
+  }, [toast, dismissToast]);
+
+  if (!toast) return null;
+  return (
+    <div
+      className="fixed bottom-4 right-4 z-[60] flex max-w-sm items-center gap-3 rounded-lg border border-ink-600 bg-ink-800 px-3 py-2 text-xs text-ink-100 shadow-2xl"
+      role="status"
+      aria-live="polite"
+    >
+      <span className="min-w-0 flex-1">{toast.message}</span>
+      {toast.action && (
+        <button
+          className="shrink-0 font-medium text-accent hover:text-ink-50"
+          onClick={async () => {
+            await toast.action?.run();
+            dismissToast();
+          }}
+        >
+          {toast.action.label}
+        </button>
+      )}
+      <button
+        className="shrink-0 text-ink-500 hover:text-ink-100"
+        aria-label="Dismiss notification"
+        onClick={dismissToast}
+      >
+        ✕
+      </button>
     </div>
   );
 }

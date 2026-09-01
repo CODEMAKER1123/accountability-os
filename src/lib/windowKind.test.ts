@@ -19,4 +19,11 @@ describe("auxiliary window routing", () => {
     expect(resolveWindowKind("?window=capture")).toBe("capture");
     expect(resolveWindowKind("?window=unknown")).toBeNull();
   });
+
+  it("routes auxiliary App URLs through a hash without changing the asset path", () => {
+    expect(resolveWindowKind("", null, "#window=widget")).toBe("widget");
+    expect(resolveWindowKind("", null, "#window=popup")).toBe("popup");
+    expect(resolveWindowKind("", null, "#window=capture")).toBe("capture");
+    expect(resolveWindowKind("", null, "#window=unknown")).toBeNull();
+  });
 });

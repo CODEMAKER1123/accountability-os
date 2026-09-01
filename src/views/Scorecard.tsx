@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { ScoreRing } from "@/components/shared";
+import { ErrorBanner, ScoreRing } from "@/components/shared";
 import {
   api,
   errorMessage,
@@ -24,9 +24,11 @@ export default function Scorecard() {
   const [insights, setInsights] = useState<Insight[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const settings = useStore((s) => s.settings);
 
   const reload = useCallback(async () => {
+    setLoading(true);
     try {
       const to = todayISO();
       const from = addDaysISO(to, -(range - 1));
@@ -41,6 +43,8 @@ export default function Scorecard() {
       setError(null);
     } catch (e) {
       setError(errorMessage(e));
+    } finally {
+      setLoading(false);
     }
   }, [range]);
 
@@ -63,6 +67,7 @@ export default function Scorecard() {
             <button
               key={r}
               onClick={() => setRange(r)}
+              aria-pressed={range === r}
               className={`rounded px-2.5 py-1 text-xs ${
                 range === r ? "bg-ink-700 text-ink-50" : "text-ink-400 hover:text-ink-200"
               }`}
@@ -73,7 +78,12 @@ export default function Scorecard() {
         </div>
       </div>
 
-      {error && <p className="text-xs text-distracted">{error}</p>}
+      {error && <ErrorBanner message={error} onRetry={() => void reload()} onDismiss={() => setError(null)} />}
+      {loading && scores.length === 0 && (
+        <div className="card text-xs text-ink-400" role="status">
+          Loading scorecard…
+        </div>
+      )}
 
       {/* Latest day breakdown — show the math (spec §20) */}
       {today && (
@@ -104,7 +114,11 @@ export default function Scorecard() {
       <div className="card">
         <p className="section-title mb-3">Execution score history</p>
         {scores.length === 0 ? (
-          <p className="text-xs text-ink-500">No scored days yet. Scores are stored when you run the end-of-day review.</p>
+          <p className="text-xs text-ink-500">
+            {loading
+              ? "Loading score history…"
+              : "No scored days yet. Scores are stored when you run the end-of-day review."}
+          </p>
         ) : (
           <div className="flex h-28 items-end gap-1">
             {scores.map((s) => (
@@ -250,7 +264,9 @@ export default function Scorecard() {
         </div>
         {insights.length === 0 ? (
           <p className="text-xs text-ink-500">
-            Not enough history yet. Insights appear after a few days of monitored, planned work.
+            {loading
+              ? "Loading insights…"
+              : "Not enough history yet. Insights appear after a few days of monitored, planned work."}
           </p>
         ) : (
           <ul className="space-y-1.5">
