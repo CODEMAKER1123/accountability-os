@@ -1,9 +1,10 @@
 // End-of-day review (spec §21–22): the day's numbers, per-commitment
 // outcomes with miss reasons, optional AI analysis.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { ScoreRing } from "@/components/shared";
+import Dialog from "@/components/Dialog";
+import { ErrorBanner, ScoreRing } from "@/components/shared";
 import { api, errorMessage, type ReviewData } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 import { fmtDuration, fmtPct } from "@/lib/time";
@@ -29,27 +30,35 @@ export default function ReviewModal() {
   const [aiBusy, setAiBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const loadReview = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const d = await api.getReviewData();
+      setData(d);
+      setAiText(d.ai_summary);
+      setSubmitted(d.already_reviewed);
+      const init: typeof items = {};
+      for (const c of d.commitments) {
+        init[c.id] = {
+          completed: c.status === "completed",
+          reason: MISS_REASONS.some(([id]) => id === c.outcome_reason) ? c.outcome_reason : null,
+          note: c.outcome_note ?? "",
+        };
+      }
+      setItems(init);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    void api
-      .getReviewData()
-      .then((d) => {
-        setData(d);
-        setAiText(d.ai_summary);
-        setSubmitted(d.already_reviewed);
-        const init: typeof items = {};
-        for (const c of d.commitments) {
-          init[c.id] = {
-            completed: c.status === "completed",
-            reason: MISS_REASONS.some(([id]) => id === c.outcome_reason) ? c.outcome_reason : null,
-            note: c.outcome_note ?? "",
-          };
-        }
-        setItems(init);
-      })
-      .catch((e) => setError(errorMessage(e)));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    void loadReview();
+  }, [loadReview]);
 
   const delay = async () => {
     await api.delayReview(30);
@@ -98,12 +107,21 @@ export default function ReviewModal() {
         commitment.status === "dropped"
       );
     }) ?? false;
+  const missingReasons = data
+    ? data.commitments.filter((commitment) => {
+        const item = items[commitment.id];
+        return (
+          !item?.completed &&
+          !item?.reason &&
+          !["deferred", "cancelled", "dropped"].includes(commitment.status)
+        );
+      }).length
+    : 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-      <div className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
+    <Dialog labelledBy="daily-review-title" onClose={() => setModal(null)} panelClassName="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
         <div className="flex items-center justify-between border-b border-ink-700 px-5 py-3">
-          <p className="text-sm font-semibold text-ink-50">Daily Review</p>
+          <p id="daily-review-title" className="text-sm font-semibold text-ink-50">Daily Review</p>
           {!submitted && (
             <div className="flex gap-2">
               <button className="btn py-1 text-xs" onClick={() => void delay()}>
@@ -116,8 +134,10 @@ export default function ReviewModal() {
           )}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          {error && <p className="mb-3 text-xs text-distracted">{error}</p>}
-          {!data ? (
+          {error && <ErrorBanner message={error} onRetry={() => void loadReview()} onDismiss={() => setError(null)} />}
+          {loading ? (
+            <p className="text-xs text-ink-400" role="status">Loading review…</p>
+          ) : !data ? (
             <p className="text-xs text-ink-400">No locked plan today — nothing to review.</p>
           ) : (
             <div className="space-y-4">
@@ -220,16 +240,22 @@ export default function ReviewModal() {
                     Done
                   </button>
                 ) : (
-                  <button className="btn btn-primary" onClick={() => void submit()} disabled={!canSubmit}>
-                    Close out the day
-                  </button>
+                  <div className="flex flex-col items-end gap-1">
+                    <button className="btn btn-primary" onClick={() => void submit()} disabled={!canSubmit}>
+                      Close out the day
+                    </button>
+                    {!canSubmit && missingReasons > 0 && (
+                      <p className="text-2xs text-ink-500">
+                        Mark each unfinished outcome completed or choose a miss reason ({missingReasons} remaining).
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

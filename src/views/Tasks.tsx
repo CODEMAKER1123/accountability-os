@@ -29,6 +29,7 @@ const STATUS_FILTERS: { id: TaskStatus | "open"; label: string }[] = [
 
 export default function Tasks() {
   const { snapshot, refreshSnapshot, setModal } = useStore();
+  const showToast = useStore((state) => state.showToast);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [allOpenTasks, setAllOpenTasks] = useState<Task[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -38,9 +39,11 @@ export default function Tasks() {
   const [editing, setEditing] = useState<Task | null>(null);
   const [showProjects, setShowProjects] = useState(false);
   const [startingTaskId, setStartingTaskId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
   const startInProgress = useRef(false);
 
   const reload = useCallback(async () => {
+    setLoading(true);
     try {
       const status = filter === "open" ? null : filter;
       const visibleTasks = api.listTasks(status, search || null);
@@ -52,6 +55,8 @@ export default function Tasks() {
       setError(null);
     } catch (e) {
       setError(errorMessage(e));
+    } finally {
+      setLoading(false);
     }
   }, [filter, search]);
 
@@ -154,6 +159,7 @@ export default function Tasks() {
           </button>
           <input
             className="input w-64"
+            aria-label="Search tasks"
             placeholder="Search tasks…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -170,6 +176,7 @@ export default function Tasks() {
           <button
             key={f.id}
             onClick={() => setFilter(f.id)}
+            aria-pressed={filter === f.id}
             className={`rounded px-2 py-1 text-xs ${
               filter === f.id ? "bg-ink-700 text-ink-50" : "text-ink-400 hover:text-ink-200"
             }`}
@@ -181,7 +188,11 @@ export default function Tasks() {
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
-      {!hasVisibleRows ? (
+      {loading && !hasVisibleRows ? (
+        <div className="card text-xs text-ink-400" role="status" aria-live="polite">
+          Loading tasks…
+        </div>
+      ) : !hasVisibleRows ? (
         <EmptyState
           title="No tasks here"
           hint={
@@ -215,6 +226,7 @@ export default function Tasks() {
                       await Promise.all([reload(), refreshSnapshot()]);
                     }}
                     onError={setError}
+                    showToast={showToast}
                   />
                 ))}
               </div>
@@ -241,6 +253,7 @@ export default function Tasks() {
                   editing={editing?.id === task.id}
                   setEditing={(open) => setEditing(open ? task : null)}
                   onError={setError}
+                  showToast={showToast}
                 />
               ))}
             </div>
@@ -262,6 +275,7 @@ function ProjectPanel({
   const [color, setColor] = useState("#4ea87c");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmingId, setConfirmingId] = useState<number | null>(null);
 
   const create = async () => {
     if (!name.trim() || busy) return;
@@ -327,6 +341,37 @@ function ProjectPanel({
                 style={{ backgroundColor: project.color ?? "#697684" }}
               />
               {project.name}
+              {confirmingId === project.id ? (
+                <>
+                  <button
+                    className="text-2xs font-medium text-distracted hover:text-ink-50"
+                    onClick={async () => {
+                      setError(null);
+                      try {
+                        await api.archiveProject(project.id);
+                        await onChanged();
+                      } catch (caught) {
+                        setError(errorMessage(caught));
+                      } finally {
+                        setConfirmingId(null);
+                      }
+                    }}
+                  >
+                    Confirm archive
+                  </button>
+                  <button className="text-2xs text-ink-500 hover:text-ink-100" onClick={() => setConfirmingId(null)}>
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="text-2xs text-ink-500 hover:text-distracted"
+                  aria-label={`Archive project: ${project.name}`}
+                  onClick={() => setConfirmingId(project.id)}
+                >
+                  Archive
+                </button>
+              )}
             </span>
           ))}
         </div>
@@ -373,6 +418,7 @@ function QuickAdd({
     <div className="flex gap-2">
       <input
         className="input flex-1"
+        aria-label="Add a task"
         placeholder="Add a task… (Enter to save)"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
@@ -380,6 +426,7 @@ function QuickAdd({
       />
       <select
         className="input w-28"
+        aria-label="Task priority"
         value={priority}
         onChange={(e) => setPriority(e.target.value as Priority)}
       >
@@ -389,6 +436,7 @@ function QuickAdd({
       </select>
       <select
         className="input w-40"
+        aria-label="Task project"
         value={projectId}
         onChange={(e) => setProjectId(e.target.value === "" ? "" : Number(e.target.value))}
       >
@@ -418,6 +466,7 @@ function TodayCommitmentRow({
   onBreak,
   onChanged,
   onError,
+  showToast,
 }: {
   commitment: Commitment;
   activeCommitmentId: number | null;
@@ -426,6 +475,7 @@ function TodayCommitmentRow({
   onBreak: boolean;
   onChanged: () => Promise<void>;
   onError: (message: string | null) => void;
+  showToast: (message: string) => void;
 }) {
   const { setModal } = useStore();
   const [busy, setBusy] = useState<"start" | "complete" | null>(null);
@@ -443,6 +493,7 @@ function TodayCommitmentRow({
     try {
       await api.completeCommitment(commitment.id);
       await onChanged();
+      showToast(`Marked “${commitment.title}” done today.`);
     } catch (caught) {
       onError(errorMessage(caught));
     } finally {
@@ -494,7 +545,7 @@ function TodayCommitmentRow({
           disabled={busy != null}
           onClick={() => void complete()}
         >
-          {busy === "complete" ? "Completing…" : "Done"}
+          {busy === "complete" ? "Completing…" : "Done today"}
         </button>
       )}
       {!terminal &&
@@ -531,6 +582,7 @@ function TaskRow({
   editing,
   setEditing,
   onError,
+  showToast,
 }: {
   task: Task;
   depth: number;
@@ -548,9 +600,11 @@ function TaskRow({
   editing: boolean;
   setEditing: (open: boolean) => void;
   onError: (message: string | null) => void;
+  showToast: (message: string) => void;
 }) {
   const { refreshSnapshot } = useStore();
   const [breakingDown, setBreakingDown] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const project = projects.find((p) => p.id === task.project_id);
   const done = task.status === "completed";
   const terminal = done || task.status === "cancelled";
@@ -572,6 +626,7 @@ function TaskRow({
         <input
           type="checkbox"
           className="h-3.5 w-3.5 accent-[#4ea87c]"
+          aria-label={`${done ? "Reopen" : "Complete"} task: ${task.title}`}
           checked={done}
           onChange={async (e) => {
             onError(null);
@@ -579,6 +634,7 @@ function TaskRow({
               if (e.target.checked && todayCommitment && !closedToday) {
                 await api.completeCommitment(todayCommitment.id);
                 await Promise.all([onChanged(), refreshSnapshot()]);
+                showToast(`Marked “${task.title}” done today.`);
                 return;
               }
               if (!e.target.checked && todayCommitment && closedToday) {
@@ -644,25 +700,44 @@ function TaskRow({
         <PriorityTag priority={task.priority} />
         <button
           className="btn-ghost btn px-2 py-1 text-ink-500 hover:text-distracted"
+          aria-label={`Delete task: ${task.title}`}
           title="Delete task"
-          onClick={async () => {
-            onError(null);
-            try {
-              await api.deleteTask(task.id);
-              await onChanged();
-            } catch (caught) {
-              onError(errorMessage(caught));
-            }
-          }}
+          onClick={() => setConfirmingDelete(true)}
         >
           ✕
         </button>
+        {confirmingDelete && (
+          <div className="flex shrink-0 items-center gap-1 rounded-md border border-distracted/40 bg-distracted/10 px-1.5 py-1">
+            <span className="text-2xs text-distracted">Delete?</span>
+            <button
+              className="btn btn-danger px-2 py-0.5 text-2xs"
+              onClick={async () => {
+                onError(null);
+                try {
+                  await api.deleteTask(task.id);
+                  await onChanged();
+                  showToast(`Deleted “${task.title}”.`);
+                } catch (caught) {
+                  onError(errorMessage(caught));
+                } finally {
+                  setConfirmingDelete(false);
+                }
+              }}
+            >
+              Delete
+            </button>
+            <button className="btn px-2 py-0.5 text-2xs" onClick={() => setConfirmingDelete(false)}>
+              Cancel
+            </button>
+          </div>
+        )}
       </div>
       {editing && (
-        <TaskEditor
-          task={task}
-          projects={projects}
-          onSaved={async () => {
+          <TaskEditor
+            task={task}
+            projects={projects}
+            onCancel={() => setEditing(false)}
+            onSaved={async () => {
             setEditing(false);
             await onChanged();
           }}
@@ -672,6 +747,7 @@ function TaskRow({
         <BreakdownEditor
           goal={task.title}
           existingSteps={childTasks.map((child) => child.title)}
+          destination="task"
           onClose={() => setBreakingDown(false)}
           onSave={async (steps) => {
             await api.createTaskSteps(task.id, steps);
@@ -687,10 +763,12 @@ function TaskRow({
 function TaskEditor({
   task,
   projects,
+  onCancel,
   onSaved,
 }: {
   task: Task;
   projects: Project[];
+  onCancel: () => void;
   onSaved: () => Promise<void>;
 }) {
   const [form, setForm] = useState({
@@ -704,6 +782,7 @@ function TaskEditor({
     tags: task.tags.join(", "),
   });
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   return (
     <div className="mt-2 space-y-2 rounded-md border border-ink-700 bg-ink-850 p-3">
       <input
@@ -782,9 +861,15 @@ function TaskEditor({
       />
       {error && <p className="text-xs text-distracted">{error}</p>}
       <div className="flex justify-end gap-2">
+        <button className="btn" onClick={onCancel}>
+          Cancel
+        </button>
         <button
           className="btn btn-primary"
+          disabled={saving || !form.title.trim()}
           onClick={async () => {
+            if (saving) return;
+            setSaving(true);
             try {
               await api.updateTask(task.id, {
                 title: form.title,
@@ -803,10 +888,12 @@ function TaskEditor({
               await onSaved();
             } catch (e) {
               setError(errorMessage(e));
+            } finally {
+              setSaving(false);
             }
           }}
         >
-          Save
+          {saving ? "Saving…" : "Save"}
         </button>
       </div>
     </div>

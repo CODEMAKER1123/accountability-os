@@ -7,7 +7,7 @@ import Interview from "@/components/Interview";
 import Onboarding from "@/components/Onboarding";
 import ReviewModal from "@/components/ReviewModal";
 import SwitchModal from "@/components/SwitchModal";
-import { ErrorBanner, MonitoringBadge } from "@/components/shared";
+import { ErrorBanner, MonitoringBadge, ToastHost } from "@/components/shared";
 import { onAppEvent } from "@/lib/events";
 import { useStore, type View } from "@/lib/store";
 import Activity from "@/views/Activity";
@@ -105,6 +105,7 @@ export default function App() {
             <button
               key={item.id}
               onClick={() => setView(item.id)}
+              aria-current={view === item.id ? "page" : undefined}
               className={`rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors ${
                 view === item.id
                   ? "bg-ink-700 font-medium text-ink-50"
@@ -164,6 +165,7 @@ export default function App() {
       {settings && !settings.monitoring_consent && settings.onboarding_completed && (
         <ConsentBanner />
       )}
+      <ToastHost />
     </div>
   );
 }

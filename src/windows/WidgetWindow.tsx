@@ -1,6 +1,7 @@
 // Always-on-top task and productivity widget (spec §25).
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -32,6 +33,8 @@ const SWITCH_DISPOSITIONS: [string, string][] = [
   ["defer", "Defer current task"],
   ["cancel", "Cancel current task"],
 ];
+
+const WIDGET_GEOMETRY_KEY = "accountability-os.widget-geometry";
 
 function monitoringLabel(snapshot: TodaySnapshot): string {
   if (snapshot.monitoring_state === "paused") return "Monitoring paused";
@@ -119,6 +122,75 @@ export default function WidgetWindow() {
       clearInterval(tick);
     };
   }, [load]);
+
+  // Keep the widget where the user left it and retain its size between app launches.
+  // Native window APIs are unavailable in the browser preview, so failures are ignored.
+  useEffect(() => {
+    let currentWindow: ReturnType<typeof getCurrentWindow>;
+    try {
+      currentWindow = getCurrentWindow();
+    } catch {
+      return;
+    }
+    let unlisten: (() => void) | undefined;
+    const saveGeometry = async () => {
+      try {
+        const [size, position] = await Promise.all([
+          currentWindow.innerSize(),
+          currentWindow.outerPosition(),
+        ]);
+        localStorage.setItem(
+          WIDGET_GEOMETRY_KEY,
+          JSON.stringify({ width: size.width, height: size.height, x: position.x, y: position.y }),
+        );
+      } catch {
+        // Preview/browser mode has no native window geometry.
+      }
+    };
+    const restoreGeometry = async () => {
+      try {
+        const stored = localStorage.getItem(WIDGET_GEOMETRY_KEY);
+        if (!stored) return;
+        const geometry = JSON.parse(stored) as Partial<Record<"width" | "height" | "x" | "y", number>>;
+        if (
+          !Number.isFinite(geometry.width) ||
+          !Number.isFinite(geometry.height) ||
+          geometry.width! < 320 ||
+          geometry.height! < 360
+        ) {
+          return;
+        }
+        await currentWindow.setSize(new PhysicalSize(geometry.width!, geometry.height!));
+        if (Number.isFinite(geometry.x) && Number.isFinite(geometry.y)) {
+          await currentWindow.setPosition(new PhysicalPosition(geometry.x!, geometry.y!));
+        }
+      } catch {
+        // Ignore malformed stored geometry or browser preview limitations.
+      }
+    };
+    void restoreGeometry();
+    void currentWindow
+      .onResized(() => void saveGeometry())
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!switchTarget) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSwitchTarget(null);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [switchTarget]);
 
   const now = Math.floor(Date.now() / 1000);
   const active = snap?.active_commitment ?? null;
@@ -238,6 +310,7 @@ export default function WidgetWindow() {
           </span>
           <button
             className="text-ink-600 hover:text-ink-300"
+            aria-label="Close widget"
             title="Close widget"
             onClick={() => void run("close", () => api.setWidgetVisible(false))}
           >
@@ -346,6 +419,8 @@ export default function WidgetWindow() {
                     view === "today" ? "bg-ink-700 text-ink-50" : "text-ink-400"
                   }`}
                   role="tab"
+                  id="widget-today-tab"
+                  aria-controls="widget-task-panel"
                   aria-selected={view === "today"}
                   onClick={() => setView("today")}
                 >
@@ -356,6 +431,8 @@ export default function WidgetWindow() {
                     view === "all" ? "bg-ink-700 text-ink-50" : "text-ink-400"
                   }`}
                   role="tab"
+                  id="widget-all-tab"
+                  aria-controls="widget-task-panel"
                   aria-selected={view === "all"}
                   onClick={() => setView("all")}
                 >
@@ -370,13 +447,19 @@ export default function WidgetWindow() {
             {view === "all" && (
               <input
                 className="input mb-1.5 h-8 select-text py-1 text-xs"
+                aria-label="Search every task"
                 placeholder="Search every task…"
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
               />
             )}
 
-            <div className="min-h-0 flex-1 overflow-y-auto pr-1" role="tabpanel">
+            <div
+              id="widget-task-panel"
+              className="min-h-0 flex-1 overflow-y-auto pr-1"
+              role="tabpanel"
+              aria-labelledby={view === "today" ? "widget-today-tab" : "widget-all-tab"}
+            >
               {view === "today" ? (
                 snap.commitments.length === 0 ? (
                   <p className="rounded-md border border-ink-700 px-3 py-2 text-xs text-ink-400">
@@ -457,12 +540,15 @@ export default function WidgetWindow() {
       {switchTarget && (
         <form
           className="absolute inset-2 z-30 flex flex-col rounded-lg border border-ink-600 bg-ink-900 p-3 shadow-2xl"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="widget-switch-title"
           onSubmit={(event) => {
             event.preventDefault();
             void submitSwitch();
           }}
         >
-          <p className="text-sm font-semibold text-ink-50">Switch priority</p>
+          <p id="widget-switch-title" className="text-sm font-semibold text-ink-50">Switch priority</p>
           <p className="mt-1 line-clamp-2 text-xs text-ink-400">Start: {switchTarget.title}</p>
           <label className="label mt-3" htmlFor="widget-switch-reason">
             What changed?

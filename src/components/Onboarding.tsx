@@ -3,6 +3,7 @@
 
 import { useEffect, useState } from "react";
 
+import Dialog from "@/components/Dialog";
 import { api, errorMessage, type MonitoringStatus, type Settings } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 
@@ -46,11 +47,10 @@ export default function Onboarding() {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink-950 p-6">
-      <div className="flex max-h-full w-full max-w-xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
+    <Dialog labelledBy="onboarding-title" panelClassName="flex max-h-full w-full max-w-xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
         <div className="border-b border-ink-700 px-5 py-3">
           <div className="flex items-center justify-between">
-            <p className="text-sm font-semibold text-ink-50">Set up Accountability OS</p>
+            <p id="onboarding-title" className="text-sm font-semibold text-ink-50">Set up Accountability OS</p>
             <p className="text-2xs text-ink-500">
               {idx + 1} / {STEPS.length}
             </p>
@@ -247,8 +247,7 @@ export default function Onboarding() {
             </button>
           )}
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

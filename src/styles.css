@@ -41,6 +41,13 @@ select {
   .btn {
     @apply inline-flex items-center justify-center gap-1.5 rounded-md border border-ink-600 bg-ink-800 px-3 py-1.5 text-[12.5px] font-medium text-ink-100 transition-colors hover:bg-ink-700 disabled:opacity-40 disabled:pointer-events-none;
   }
+  .btn:focus-visible,
+  .input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  input:focus-visible {
+    @apply outline-none ring-2 ring-accent/60 ring-offset-1 ring-offset-ink-950;
+  }
   .btn-primary {
     @apply border-accent-dim bg-accent/20 text-ink-50 hover:bg-accent/30;
   }

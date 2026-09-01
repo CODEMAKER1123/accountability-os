@@ -23,6 +23,7 @@ export default function AppUpdater() {
   const mounted = useRef(true);
   const refreshInProgress = useRef(false);
   const installInProgress = useRef(false);
+  const checkNowRef = useRef<() => Promise<void>>(async () => undefined);
 
   useEffect(() => {
     mounted.current = true;
@@ -50,6 +51,7 @@ export default function AppUpdater() {
         if (mounted.current) setRefreshing(false);
       }
     };
+    checkNowRef.current = checkNow;
     const initial = window.setTimeout(() => void checkNow(), STARTUP_CHECK_DELAY_MS);
     const interval = window.setInterval(() => void checkNow(), BACKGROUND_CHECK_INTERVAL_MS);
     window.addEventListener("focus", checkNow);
@@ -58,10 +60,22 @@ export default function AppUpdater() {
       window.clearTimeout(initial);
       window.clearInterval(interval);
       window.removeEventListener("focus", checkNow);
+      checkNowRef.current = async () => undefined;
     };
   }, []);
 
-  if (!update) return null;
+  if (!update) {
+    return (
+      <button
+        type="button"
+        className="w-full rounded-md px-2 py-1 text-left text-2xs text-ink-500 transition hover:bg-ink-800 hover:text-ink-200 disabled:cursor-wait"
+        onClick={() => void checkNowRef.current()}
+        disabled={refreshing}
+      >
+        {refreshing ? "Checking for updates…" : "Check for updates"}
+      </button>
+    );
+  }
 
   const install = async () => {
     if (

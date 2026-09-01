@@ -21,6 +21,7 @@ import {
 import { useStore } from "@/lib/store";
 import { fmtDuration, todayISO } from "@/lib/time";
 import { PriorityTag } from "@/components/shared";
+import Dialog from "@/components/Dialog";
 
 type Candidate = InterviewCandidate;
 
@@ -322,11 +323,10 @@ export default function Interview({ mode = "new" }: { mode?: "new" | "edit" }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-      <div className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
+    <Dialog labelledBy="daily-interview-title" onClose={() => setModal(null)} panelClassName="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-ink-600 bg-ink-900 shadow-2xl">
         <div className="flex items-center justify-between border-b border-ink-700 px-5 py-3">
           <div>
-            <p className="text-sm font-semibold text-ink-50">
+            <p id="daily-interview-title" className="text-sm font-semibold text-ink-50">
               {editing ? "Edit Today's Plan" : "Daily Planning Interview"}
             </p>
             {editing && (
@@ -810,8 +810,7 @@ export default function Interview({ mode = "new" }: { mode?: "new" | "edit" }) {
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 

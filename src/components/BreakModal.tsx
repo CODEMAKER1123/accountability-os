@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import Dialog from "@/components/Dialog";
 import { api, errorMessage } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 
@@ -21,9 +22,8 @@ export default function BreakModal() {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-      <div className="w-full max-w-sm rounded-xl border border-ink-600 bg-ink-900 p-5 shadow-2xl">
-        <p className="text-sm font-semibold text-ink-50">Take a break</p>
+    <Dialog labelledBy="take-break-title" onClose={() => setModal(null)} panelClassName="w-full max-w-sm rounded-xl border border-ink-600 bg-ink-900 p-5 shadow-2xl">
+        <p id="take-break-title" className="text-sm font-semibold text-ink-50">Take a break</p>
         <p className="mt-1 text-xs text-ink-400">
           Planned breaks pause distraction tracking. You'll be notified when it ends.
         </p>
@@ -58,7 +58,6 @@ export default function BreakModal() {
             Cancel
           </button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
