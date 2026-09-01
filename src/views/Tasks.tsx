@@ -79,6 +79,16 @@ export default function Tasks() {
       todayCommitmentByTask.set(commitment.task_id, commitment);
     }
   }
+  const searchTerm = search.trim().toLowerCase();
+  const visibleUnlinkedToday =
+    filter === "open"
+      ? (snapshot?.commitments ?? []).filter(
+          (commitment) =>
+            commitment.task_id == null &&
+            !["completed", "deferred", "dropped", "cancelled"].includes(commitment.status) &&
+            (!searchTerm || commitment.title.toLowerCase().includes(searchTerm)),
+        )
+      : [];
   const activeCommitmentId = snapshot?.active_commitment?.id ?? null;
   const pausedCommitmentId =
     activeCommitmentId == null
@@ -87,6 +97,7 @@ export default function Tasks() {
   const currentContractId = activeCommitmentId ?? pausedCommitmentId;
   const now = Math.floor(Date.now() / 1000);
   const onBreak = Boolean(snapshot?.current_break && snapshot.current_break.ends_at > now);
+  const hasVisibleRows = tasks.length > 0 || visibleUnlinkedToday.length > 0;
 
   const startTask = async (task: Task, existingCommitment: Commitment | null) => {
     if (startInProgress.current || onBreak) return;
@@ -170,7 +181,7 @@ export default function Tasks() {
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
-      {tasks.length === 0 ? (
+      {!hasVisibleRows ? (
         <EmptyState
           title="No tasks here"
           hint={
@@ -182,29 +193,59 @@ export default function Tasks() {
           }
         />
       ) : (
-        <div className="divide-y divide-ink-800 rounded-lg border border-ink-700 bg-ink-900">
-          {taskRows.map(({ task, depth, directChildren }) => (
-            <TaskRow
-              key={task.id}
-              task={task}
-              depth={depth}
-              childTasks={allChildrenByParent.get(task.id) ?? directChildren}
-              projects={projects}
-              todayCommitment={todayCommitmentByTask.get(task.id) ?? null}
-              activeCommitmentId={activeCommitmentId}
-              pausedCommitmentId={pausedCommitmentId}
-              currentContractId={currentContractId}
-              onBreak={onBreak}
-              starting={startingTaskId === task.id}
-              startBusy={startingTaskId != null}
-              onStart={startTask}
-              onChanged={reload}
-              editing={editing?.id === task.id}
-              setEditing={(open) => setEditing(open ? task : null)}
-              onError={setError}
-            />
-          ))}
-        </div>
+        <>
+          {visibleUnlinkedToday.length > 0 && (
+            <section className="rounded-lg border border-focus/30 bg-ink-900 p-3">
+              <div className="mb-2">
+                <p className="section-title text-focus">Today&apos;s commitments</p>
+                <p className="mt-1 text-xs text-ink-400">
+                  Outcomes from today&apos;s plan that are not linked to a backlog task yet.
+                </p>
+              </div>
+              <div className="space-y-2">
+                {visibleUnlinkedToday.map((commitment) => (
+                  <TodayCommitmentRow
+                    key={commitment.id}
+                    commitment={commitment}
+                    activeCommitmentId={activeCommitmentId}
+                    pausedCommitmentId={pausedCommitmentId}
+                    currentContractId={currentContractId}
+                    onBreak={onBreak}
+                    onChanged={async () => {
+                      await Promise.all([reload(), refreshSnapshot()]);
+                    }}
+                    onError={setError}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+          {tasks.length > 0 && (
+            <div className="divide-y divide-ink-800 rounded-lg border border-ink-700 bg-ink-900">
+              {taskRows.map(({ task, depth, directChildren }) => (
+                <TaskRow
+                  key={task.id}
+                  task={task}
+                  depth={depth}
+                  childTasks={allChildrenByParent.get(task.id) ?? directChildren}
+                  projects={projects}
+                  todayCommitment={todayCommitmentByTask.get(task.id) ?? null}
+                  activeCommitmentId={activeCommitmentId}
+                  pausedCommitmentId={pausedCommitmentId}
+                  currentContractId={currentContractId}
+                  onBreak={onBreak}
+                  starting={startingTaskId === task.id}
+                  startBusy={startingTaskId != null}
+                  onStart={startTask}
+                  onChanged={reload}
+                  editing={editing?.id === task.id}
+                  setEditing={(open) => setEditing(open ? task : null)}
+                  onError={setError}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -369,6 +410,110 @@ function QuickAdd({
   );
 }
 
+function TodayCommitmentRow({
+  commitment,
+  activeCommitmentId,
+  pausedCommitmentId,
+  currentContractId,
+  onBreak,
+  onChanged,
+  onError,
+}: {
+  commitment: Commitment;
+  activeCommitmentId: number | null;
+  pausedCommitmentId: number | null;
+  currentContractId: number | null;
+  onBreak: boolean;
+  onChanged: () => Promise<void>;
+  onError: (message: string | null) => void;
+}) {
+  const { setModal } = useStore();
+  const [busy, setBusy] = useState<"start" | "complete" | null>(null);
+  const terminal = ["completed", "deferred", "dropped", "cancelled"].includes(
+    commitment.status,
+  );
+  const isActive = commitment.id === activeCommitmentId;
+  const isPaused = commitment.id === pausedCommitmentId;
+  const requiresSwitch = currentContractId != null && currentContractId !== commitment.id;
+
+  const complete = async () => {
+    if (busy != null || terminal) return;
+    setBusy("complete");
+    onError(null);
+    try {
+      await api.completeCommitment(commitment.id);
+      await onChanged();
+    } catch (caught) {
+      onError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const start = async () => {
+    if (busy != null || terminal || onBreak) return;
+    if (requiresSwitch) {
+      setModal({
+        kind: "switch",
+        fromCommitmentId: currentContractId,
+        toCommitmentId: commitment.id,
+      });
+      return;
+    }
+    setBusy("start");
+    onError(null);
+    try {
+      await api.startCommitment(commitment.id);
+      await onChanged();
+    } catch (caught) {
+      onError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div
+      className={`flex items-center gap-3 rounded-md border px-3 py-2 ${
+        isActive ? "border-focus/40 bg-focus/5" : "border-ink-700 bg-ink-850"
+      }`}
+    >
+      <div className="min-w-0 flex-1">
+        <p className={`truncate text-[13px] ${terminal ? "text-ink-500 line-through" : "text-ink-100"}`}>
+          {commitment.title}
+        </p>
+        <p className="text-2xs text-ink-500">
+          {commitment.status} today
+          {commitment.steps.length > 0 &&
+            ` · ${commitment.steps.filter((step) => step.completed).length}/${commitment.steps.length} steps`}
+        </p>
+      </div>
+      {!terminal && (
+        <button
+          className="btn btn-primary shrink-0 py-1"
+          disabled={busy != null}
+          onClick={() => void complete()}
+        >
+          {busy === "complete" ? "Completing…" : "Done"}
+        </button>
+      )}
+      {!terminal &&
+        (isActive ? (
+          <span className="shrink-0 text-xs font-medium text-focus">Active</span>
+        ) : (
+          <button
+            className="btn shrink-0 py-1"
+            disabled={busy != null || onBreak}
+            title={onBreak ? "End the current break before starting work." : undefined}
+            onClick={() => void start()}
+          >
+            {onBreak ? "On break" : busy === "start" ? "Starting…" : isPaused ? "Resume" : requiresSwitch ? "Switch" : "Start"}
+          </button>
+        ))}
+    </div>
+  );
+}
+
 function TaskRow({
   task,
   depth,
@@ -404,6 +549,7 @@ function TaskRow({
   setEditing: (open: boolean) => void;
   onError: (message: string | null) => void;
 }) {
+  const { refreshSnapshot } = useStore();
   const [breakingDown, setBreakingDown] = useState(false);
   const project = projects.find((p) => p.id === task.project_id);
   const done = task.status === "completed";
@@ -430,6 +576,15 @@ function TaskRow({
           onChange={async (e) => {
             onError(null);
             try {
+              if (e.target.checked && todayCommitment && !closedToday) {
+                await api.completeCommitment(todayCommitment.id);
+                await Promise.all([onChanged(), refreshSnapshot()]);
+                return;
+              }
+              if (!e.target.checked && todayCommitment && closedToday) {
+                onError("Today's completed commitment cannot be reopened from the task list.");
+                return;
+              }
               await api.setTaskStatus(task.id, e.target.checked ? "completed" : "planned");
               await onChanged();
             } catch (caught) {

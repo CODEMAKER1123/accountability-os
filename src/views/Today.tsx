@@ -341,6 +341,7 @@ function CommitmentRow({
 }) {
   const { refreshSnapshot, snapshot, setModal } = useStore();
   const [starting, setStarting] = useState(false);
+  const [completing, setCompleting] = useState(false);
   const [showSteps, setShowSteps] = useState(false);
   const done = commitment.status === "completed";
   const isActive = commitment.id === activeId;
@@ -357,6 +358,19 @@ function CommitmentRow({
   const requiresSwitch = contractId != null && !isPausedContract;
   const focused =
     snapshot?.commitment_progress.find((p) => p.commitment_id === commitment.id)?.focused_secs ?? 0;
+  const complete = async () => {
+    if (completing || done || isTerminal) return;
+    setCompleting(true);
+    onError(null);
+    try {
+      await api.completeCommitment(commitment.id);
+      await refreshSnapshot();
+    } catch (error) {
+      onError(errorMessage(error));
+    } finally {
+      setCompleting(false);
+    }
+  };
   return (
     <div
       className={`rounded-md border px-3 py-2 ${
@@ -394,45 +408,58 @@ function CommitmentRow({
         <PriorityTag priority={commitment.priority} />
         {done ? (
           <span className="text-xs text-focus">Done</span>
-        ) : isActive ? (
-          <span className="text-xs text-focus">Active</span>
-        ) : isTerminal ? null : requiresSwitch ? (
-          <button
-            className="btn py-1"
-            onClick={() => setModal({ kind: "switch", fromCommitmentId: contractId })}
-          >
-            Switch
-          </button>
         ) : (
-          <button
-            className="btn py-1"
-            disabled={starting}
-            onClick={async () => {
-              if (activeId != null && activeId !== commitment.id) {
-                // Another commitment is active: switching must be intentional —
-                // collect the reason + disposition (spec §7, §15).
-                setModal({
-                  kind: "switch",
-                  fromCommitmentId: activeId,
-                  toCommitmentId: commitment.id,
-                });
-                return;
-              }
-              if (starting) return;
-              setStarting(true);
-              onError(null);
-              try {
-                await api.startCommitment(commitment.id);
-                await refreshSnapshot();
-              } catch (error) {
-                onError(errorMessage(error));
-              } finally {
-                setStarting(false);
-              }
-            }}
-          >
-            {starting ? "Starting…" : isPausedContract ? "Resume" : "Start"}
-          </button>
+          <>
+            {!isTerminal && (
+              <button
+                className="btn btn-primary py-1"
+                disabled={completing || starting}
+                onClick={() => void complete()}
+              >
+                {completing ? "Completing…" : "Done"}
+              </button>
+            )}
+            {isActive ? (
+              <span className="text-xs text-focus">Active</span>
+            ) : isTerminal ? null : requiresSwitch ? (
+              <button
+                className="btn py-1"
+                onClick={() => setModal({ kind: "switch", fromCommitmentId: contractId })}
+              >
+                Switch
+              </button>
+            ) : (
+              <button
+                className="btn py-1"
+                disabled={starting || completing}
+                onClick={async () => {
+                  if (activeId != null && activeId !== commitment.id) {
+                    // Another commitment is active: switching must be intentional —
+                    // collect the reason + disposition (spec §7, §15).
+                    setModal({
+                      kind: "switch",
+                      fromCommitmentId: activeId,
+                      toCommitmentId: commitment.id,
+                    });
+                    return;
+                  }
+                  if (starting) return;
+                  setStarting(true);
+                  onError(null);
+                  try {
+                    await api.startCommitment(commitment.id);
+                    await refreshSnapshot();
+                  } catch (error) {
+                    onError(errorMessage(error));
+                  } finally {
+                    setStarting(false);
+                  }
+                }}
+              >
+                {starting ? "Starting…" : isPausedContract ? "Resume" : "Start"}
+              </button>
+            )}
+          </>
         )}
       </div>
       {showSteps && (
