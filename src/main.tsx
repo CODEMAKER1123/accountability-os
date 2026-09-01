@@ -9,10 +9,19 @@ import PopupWindow from "./windows/PopupWindow";
 import WidgetWindow from "./windows/WidgetWindow";
 import "./styles.css";
 
-// One bundle serves every window. Production routing uses the Tauri window
-// label; query routing is retained only for normal-browser previews.
-const tauriLabel = "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : null;
-const kind = resolveWindowKind(window.location.search, tauriLabel);
+// One bundle serves every window. Auxiliary windows carry a hash route so
+// their App URL stays a valid asset path in both dev and packaged builds.
+// Tauri labels remain a fallback for older windows and native-created pages.
+let tauriLabel: string | null = null;
+if ("__TAURI_INTERNALS__" in window) {
+  try {
+    tauriLabel = getCurrentWindow().label;
+  } catch {
+    // A webview can briefly expose Tauri internals before its metadata is ready.
+    // Hash routing below still selects the correct auxiliary surface.
+  }
+}
+const kind = resolveWindowKind(window.location.search, tauriLabel, window.location.hash);
 
 function Root() {
   switch (kind) {

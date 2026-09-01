@@ -634,7 +634,11 @@ pub fn set_widget_visible(app: tauri::AppHandle, state: State<'_, AppState>, vis
         if visible {
             let _ = w.show();
         } else {
-            let _ = w.close();
+            // Keep the webview alive when the user closes the widget. Reusing a
+            // closed WebviewWindow handle can produce a blank surface on the
+            // next show; hiding preserves the loaded React document and its
+            // persisted geometry while still removing the widget from view.
+            let _ = w.hide();
         }
         return Ok(());
     }
@@ -644,7 +648,7 @@ pub fn set_widget_visible(app: tauri::AppHandle, state: State<'_, AppState>, vis
     tauri::WebviewWindowBuilder::new(
         &app,
         "widget",
-        tauri::WebviewUrl::App("index.html".into()),
+        tauri::WebviewUrl::App("index.html#window=widget".into()),
     )
     .title("Focus")
     .inner_size(340.0, 430.0)
@@ -670,7 +674,7 @@ pub fn open_quick_capture(app: tauri::AppHandle) -> AppResult<()> {
     tauri::WebviewWindowBuilder::new(
         &app,
         "capture",
-        tauri::WebviewUrl::App("index.html".into()),
+        tauri::WebviewUrl::App("index.html#window=capture".into()),
     )
     .title("Quick Capture")
     .inner_size(560.0, 190.0)
