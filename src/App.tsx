@@ -10,6 +10,7 @@ import SwitchModal from "@/components/SwitchModal";
 import { ErrorBanner, MonitoringBadge, ToastHost } from "@/components/shared";
 import { onAppEvent } from "@/lib/events";
 import { useStore, type View } from "@/lib/store";
+import { useTheme } from "@/lib/theme";
 import Activity from "@/views/Activity";
 import Plan from "@/views/Plan";
 import Scorecard from "@/views/Scorecard";
@@ -38,6 +39,7 @@ export default function App() {
     settings,
     loadSettings,
   } = useStore();
+  const { theme, setTheme } = useTheme();
 
   useEffect(() => {
     void refreshSnapshot();
@@ -117,6 +119,14 @@ export default function App() {
           ))}
         </nav>
         <div className="mt-auto space-y-2 border-t border-ink-700 p-3">
+          <button
+            className="btn btn-ghost w-full justify-start px-2 py-1 text-xs"
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          >
+            <span aria-hidden="true">{theme === "dark" ? "☀" : "☾"}</span>
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </button>
           <AppUpdater />
           {snapshot && (
             <MonitoringBadge

@@ -5,20 +5,22 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Subdued desktop palette, Linear-like. Single committed dark look.
+        // Semantic palette tokens. Values are swapped by [data-theme="light"]
+        // in styles.css so every existing utility adapts without per-component
+        // light-mode variants.
         ink: {
-          950: "#0b0d10",
-          900: "#101317",
-          850: "#14181d",
-          800: "#191e24",
-          700: "#232a32",
-          600: "#2f3843",
-          500: "#4a5561",
-          400: "#6b7683",
-          300: "#8f99a5",
-          200: "#b6bec8",
-          100: "#dde2e8",
-          50: "#f2f4f6",
+          950: "rgb(var(--ink-950) / <alpha-value>)",
+          900: "rgb(var(--ink-900) / <alpha-value>)",
+          850: "rgb(var(--ink-850) / <alpha-value>)",
+          800: "rgb(var(--ink-800) / <alpha-value>)",
+          700: "rgb(var(--ink-700) / <alpha-value>)",
+          600: "rgb(var(--ink-600) / <alpha-value>)",
+          500: "rgb(var(--ink-500) / <alpha-value>)",
+          400: "rgb(var(--ink-400) / <alpha-value>)",
+          300: "rgb(var(--ink-300) / <alpha-value>)",
+          200: "rgb(var(--ink-200) / <alpha-value>)",
+          100: "rgb(var(--ink-100) / <alpha-value>)",
+          50: "rgb(var(--ink-50) / <alpha-value>)",
         },
         accent: {
           DEFAULT: "#5b8def",

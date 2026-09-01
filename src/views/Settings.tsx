@@ -13,9 +13,11 @@ import {
 } from "@/lib/ipc";
 import { useStore } from "@/lib/store";
 import { fmtMinOfDay } from "@/lib/time";
+import { useTheme } from "@/lib/theme";
 
 export default function Settings() {
   const { settings, loadSettings, setSettings, refreshSnapshot, snapshot } = useStore();
+  const { theme, setTheme } = useTheme();
   const [form, setForm] = useState<SettingsModel | null>(settings);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -76,6 +78,32 @@ export default function Settings() {
           </button>
         </div>
       </div>
+
+      {/* Appearance */}
+      <section className="card space-y-3">
+        <p className="section-title">Appearance</p>
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-[13px] text-ink-100">Color theme</p>
+            <p className="text-2xs text-ink-500">Choose the look that is easiest on your eyes. This applies to every app window.</p>
+          </div>
+          <div className="flex shrink-0 rounded-md border border-ink-700 bg-ink-950 p-0.5" role="group" aria-label="Color theme">
+            {(["light", "dark"] as const).map((option) => (
+              <button
+                key={option}
+                type="button"
+                aria-pressed={theme === option}
+                className={`rounded px-2.5 py-1 text-xs capitalize transition-colors ${
+                  theme === option ? "bg-ink-700 font-medium text-ink-50" : "text-ink-400 hover:text-ink-100"
+                }`}
+                onClick={() => setTheme(option)}
+              >
+                {option === "light" ? "☀ Light" : "☾ Dark"}
+              </button>
+            ))}
+          </div>
+        </div>
+      </section>
 
       {/* Work rhythm */}
       <section className="card space-y-3">

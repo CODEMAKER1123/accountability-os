@@ -3,11 +3,17 @@ import ReactDOM from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import App from "./App";
+import { applyDocumentTheme, readStoredTheme, ThemeProvider } from "./lib/theme";
 import { resolveWindowKind } from "./lib/windowKind";
 import CaptureWindow from "./windows/CaptureWindow";
 import PopupWindow from "./windows/PopupWindow";
 import WidgetWindow from "./windows/WidgetWindow";
 import "./styles.css";
+
+// Apply the saved theme before React paints to avoid a flash of the default
+// dark palette. The provider keeps the document and sibling Tauri windows in
+// sync after the initial render.
+applyDocumentTheme(readStoredTheme());
 
 // One bundle serves every window. Auxiliary windows carry a hash route so
 // their App URL stays a valid asset path in both dev and packaged builds.
@@ -38,6 +44,8 @@ function Root() {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <Root />
+    <ThemeProvider>
+      <Root />
+    </ThemeProvider>
   </React.StrictMode>,
 );
